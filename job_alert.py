@@ -1,14 +1,15 @@
 """
 Daily Job Alert — Siddharth Singh
-Fetches backend/distributed-systems roles via Adzuna API (free tier),
-sorted by date (most recent first), sends a styled digest via Gmail SMTP.
+Scrapes fresh job listings directly from LinkedIn Jobs public search
+(no login required), filters for relevance and recency (≤3 days),
+sends a styled digest via Gmail SMTP.
 
 Required GitHub Actions secrets:
-  ADZUNA_APP_ID       — from developer.adzuna.com
-  ADZUNA_APP_KEY      — from developer.adzuna.com
   GMAIL_ADDRESS       — your Gmail address
   GMAIL_APP_PASSWORD  — 16-char Gmail App Password
   RECIPIENT_EMAIL     — where to deliver the digest
+
+NO external API keys needed.
 """
 
 import os
@@ -18,8 +19,11 @@ import datetime
 import urllib.request
 import urllib.parse
 import urllib.error
+import time
+import re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html.parser import HTMLParser
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -28,177 +32,292 @@ CANDIDATE_PROFILE = {
     "stack": "Java · Kafka · Cassandra · Spark · Spring Boot · Kubernetes",
 }
 
-# Broad queries → more results. Adzuna free = 250 req/day, we use ~8
-SEARCH_QUERIES = [
-    "backend engineer",
-    "software engineer java",
-    "senior software engineer",
-    "distributed systems engineer",
-    "java developer kafka",
-    "platform engineer java",
-    "software engineer kafka cassandra",
-    "senior backend developer",
+# LinkedIn job search queries — each maps to one search URL
+# f=TPR_1&f_TPR=r259200  → posted in last 3 days (259200 seconds)
+# f_E=4  → Associate + Mid-Senior level
+# f_JT=F → Full-time only
+
+LINKEDIN_SEARCHES = [
+    {
+        "label": "Backend Engineer India",
+        "url": (
+            "https://www.linkedin.com/jobs/search/?keywords=backend+engineer+java+kafka"
+            "&location=India&f_TPR=r259200&f_JT=F&f_E=4&sortBy=DD"
+        ),
+    },
+    {
+        "label": "Distributed Systems India",
+        "url": (
+            "https://www.linkedin.com/jobs/search/?keywords=distributed+systems+engineer+java"
+            "&location=India&f_TPR=r259200&f_JT=F&f_E=4&sortBy=DD"
+        ),
+    },
+    {
+        "label": "Senior SWE Kafka India",
+        "url": (
+            "https://www.linkedin.com/jobs/search/?keywords=senior+software+engineer+kafka+java"
+            "&location=India&f_TPR=r259200&f_JT=F&f_E=4&sortBy=DD"
+        ),
+    },
+    {
+        "label": "Platform Engineer Kafka India",
+        "url": (
+            "https://www.linkedin.com/jobs/search/?keywords=platform+engineer+kafka+kubernetes"
+            "&location=India&f_TPR=r259200&f_JT=F&sortBy=DD"
+        ),
+    },
+    {
+        "label": "Java Spring Boot Senior India",
+        "url": (
+            "https://www.linkedin.com/jobs/search/?keywords=senior+java+developer+spring+boot"
+            "&location=India&f_TPR=r259200&f_JT=F&f_E=4&sortBy=DD"
+        ),
+    },
 ]
 
-# Keywords that must appear in title or description to be included
-RELEVANT_KEYWORDS = [
-    "java", "kafka", "cassandra", "spark", "backend", "distributed",
-    "spring", "microservice", "kubernetes", "scala", "streaming",
-    "platform engineer", "software engineer", "sde", "swe",
-]
-
-# These company names get a blue highlight badge in the email
 TARGET_COMPANIES = [
     "google", "microsoft", "amazon", "aws", "uber", "flipkart", "phonepe",
     "razorpay", "cred", "swiggy", "confluent", "databricks", "zepto",
     "meesho", "zomato", "atlassian", "adobe", "salesforce", "goldman sachs",
     "jp morgan", "morgan stanley", "deutsche bank", "paypal", "linkedin",
-    "meta", "apple", "netflix", "airbnb", "stripe", "coinbase", "walmart",
-    "target", "visa", "mastercard", "barclays", "hsbc", "thoughtworks",
-    "infosys", "tcs", "wipro", "accenture", "oracle", "sap", "ibm",
+    "meta", "apple", "netflix", "airbnb", "stripe", "walmart", "visa",
+    "mastercard", "barclays", "hsbc", "thoughtworks", "oracle", "sap",
+    "bytedance", "groww", "slice", "navi", "smallcase", "browserstack",
+    "postman", "freshworks", "zoho", "chargebee", "clevertap", "lenskart",
 ]
 
-ADZUNA_COUNTRY   = "in"
-RESULTS_PER_PAGE = 20          # max per Adzuna call
-MIN_SALARY_INR   = 1_500_000   # 15 LPA floor (cast wider, filter later)
-MAX_JOBS_IN_EMAIL = 20         # cap email length
+EXCLUDE_COMPANY_KEYWORDS = [
+    "consultancy", "consulting", "recruiter", "staffing", "solutions pvt",
+    "manpower", "hiring", "placement", "talent", "ventures pvt", "infotech",
+    "technologies pvt", "softwares", "it services",
+]
 
-# ── Fetch from Adzuna ─────────────────────────────────────────────────────────
+MAX_JOBS_IN_EMAIL = 20
 
-def fetch_adzuna(query: str, app_id: str, app_key: str) -> list[dict]:
-    params = urllib.parse.urlencode({
-        "app_id":          app_id,
-        "app_key":         app_key,
-        "results_per_page": RESULTS_PER_PAGE,
-        "what":            query,
-        "where":           "India",
-        "salary_min":      MIN_SALARY_INR,
-        "sort_by":         "date",          # ← most recent first
-        "content-type":    "application/json",
-    })
-    url = f"https://api.adzuna.com/v1/api/jobs/{ADZUNA_COUNTRY}/search/1?{params}"
-    req = urllib.request.Request(url, headers={"User-Agent": "JobAlertBot/1.0"})
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# ── LinkedIn Scraper ───────────────────────────────────────────────────────────
+
+class JobCardParser(HTMLParser):
+    """Parse LinkedIn job search results page to extract job cards."""
+
+    def __init__(self):
+        super().__init__()
+        self.jobs: list[dict] = []
+        self._current: dict = {}
+        self._capture_field: str | None = None
+        self._depth = 0
+        self._in_card = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        classes = attrs_dict.get("class", "")
+
+        # Detect job card containers
+        if tag == "li" and "base-card" in classes:
+            self._current = {}
+            self._in_card = True
+
+        if not self._in_card:
+            return
+
+        # Job title link
+        if tag == "a" and "base-card__full-link" in classes:
+            href = attrs_dict.get("href", "")
+            if href:
+                self._current["url"] = href.split("?")[0]
+
+        if tag == "h3" and "base-search-card__title" in classes:
+            self._capture_field = "title"
+
+        if tag == "h4" and "base-search-card__subtitle" in classes:
+            self._capture_field = "company"
+
+        if tag == "span" and "job-search-card__location" in classes:
+            self._capture_field = "location"
+
+        if tag == "time":
+            self._current["posted_raw"] = attrs_dict.get("datetime", "")
+            self._capture_field = "posted_label"
+
+    def handle_data(self, data):
+        if self._capture_field:
+            existing = self._current.get(self._capture_field, "")
+            self._current[self._capture_field] = (existing + data).strip()
+
+    def handle_endtag(self, tag):
+        if tag in ("h3", "h4", "span", "time"):
+            self._capture_field = None
+
+        if tag == "li" and self._in_card and self._current.get("title"):
+            self.jobs.append(dict(self._current))
+            self._current = {}
+            self._in_card = False
+
+
+def scrape_linkedin(search_url: str, label: str) -> list[dict]:
+    """Fetch and parse a LinkedIn jobs search page."""
+    req = urllib.request.Request(search_url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data.get("results", [])
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as e:
-        print(f"  Adzuna HTTP {e.code} for '{query}': {e.reason}")
+        print(f"  HTTP {e.code} for '{label}'")
         return []
     except Exception as e:
-        print(f"  Adzuna error for '{query}': {e}")
+        print(f"  Error for '{label}': {e}")
         return []
 
+    parser = JobCardParser()
+    parser.feed(html)
 
-def is_relevant(title: str, desc: str) -> bool:
-    text = (title + " " + desc).lower()
-    return any(kw in text for kw in RELEVANT_KEYWORDS)
+    if not parser.jobs:
+        # Fallback: extract from embedded JSON (LinkedIn sometimes renders this way)
+        jobs = extract_from_json_ld(html)
+        print(f"  '{label}': {len(jobs)} jobs (via JSON fallback)")
+        return jobs
+
+    print(f"  '{label}': {len(parser.jobs)} jobs parsed")
+    return parser.jobs
 
 
-def is_target_company(name: str) -> bool:
-    return any(t in name.lower() for t in TARGET_COMPANIES)
+def extract_from_json_ld(html: str) -> list[dict]:
+    """Try to extract jobs from JSON-LD embedded in the page."""
+    jobs = []
+    matches = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL)
+    for match in matches:
+        try:
+            data = json.loads(match)
+            if isinstance(data, dict) and data.get("@type") == "JobPosting":
+                jobs.append({
+                    "title":       data.get("title", ""),
+                    "company":     data.get("hiringOrganization", {}).get("name", ""),
+                    "location":    data.get("jobLocation", {}).get("address", {}).get("addressLocality", "India"),
+                    "url":         data.get("url", "#"),
+                    "posted_raw":  data.get("datePosted", ""),
+                    "posted_label": "",
+                })
+        except Exception:
+            pass
+    return jobs
 
 
-def parse_salary(r: dict) -> str:
-    sal_min = r.get("salary_min") or 0
-    sal_max = r.get("salary_max") or 0
-    if sal_min and sal_max:
-        return f"{round(sal_min/100_000)}–{round(sal_max/100_000)} LPA"
-    if sal_min:
-        return f"{round(sal_min/100_000)}+ LPA"
-    return "Competitive"
+# ── Filtering & Processing ─────────────────────────────────────────────────────
+
+def is_consultancy(company: str) -> bool:
+    c = company.lower()
+    return any(kw in c for kw in EXCLUDE_COMPANY_KEYWORDS)
+
+
+def is_target_company(company: str) -> bool:
+    return any(t in company.lower() for t in TARGET_COMPANIES)
+
+
+def days_ago(posted_raw: str) -> int | None:
+    """Return how many days ago the job was posted, or None if unknown."""
+    if not posted_raw:
+        return None
+    try:
+        dt = datetime.date.fromisoformat(posted_raw[:10])
+        return (datetime.date.today() - dt).days
+    except Exception:
+        return None
+
+
+def days_label(d: int | None) -> str:
+    if d is None:
+        return "recently"
+    if d == 0:
+        return "today"
+    if d == 1:
+        return "yesterday"
+    return f"{d}d ago"
 
 
 def fetch_jobs() -> list[dict]:
-    app_id  = os.environ["ADZUNA_APP_ID"]
-    app_key = os.environ["ADZUNA_APP_KEY"]
-
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
+    seen_titles: set[str] = set()
     all_jobs: list[dict] = []
 
-    for query in SEARCH_QUERIES:
-        print(f"  Searching: '{query}'...")
-        results = fetch_adzuna(query, app_id, app_key)
-        added = 0
-        for r in results:
-            job_id = r.get("id", "")
-            if not job_id or job_id in seen:
+    for search in LINKEDIN_SEARCHES:
+        print(f"  Scraping: {search['label']}...")
+        raw = scrape_linkedin(search["url"], search["label"])
+        time.sleep(2)  # polite delay between requests
+
+        for r in raw:
+            title   = r.get("title", "").strip()
+            company = r.get("company", "").strip()
+            url     = r.get("url", "#")
+            location = r.get("location", "India").strip()
+            posted_raw = r.get("posted_raw", "")
+
+            if not title or not company:
                 continue
 
-            title   = r.get("title", "")
-            desc    = (r.get("description") or "")
-            company = r.get("company", {}).get("display_name", "Unknown")
+            # Dedup by URL or title+company
+            dedup_key = url if url != "#" else f"{company.lower()}|{title.lower()[:40]}"
+            if dedup_key in seen_urls:
+                continue
+            seen_urls.add(dedup_key)
 
-            if not is_relevant(title, desc):
+            # Skip consultancies/staffing firms
+            if is_consultancy(company):
                 continue
 
-            seen.add(job_id)
-            added += 1
-
-            location_parts = r.get("location", {}).get("area", [])
-            location = ", ".join(location_parts[-2:]) if location_parts else "India"
-
-            created = r.get("created", "")[:10]   # YYYY-MM-DD
-            redirect_url = r.get("redirect_url", "#")
+            # Skip jobs older than 3 days
+            age = days_ago(posted_raw)
+            if age is not None and age > 3:
+                continue
 
             all_jobs.append({
-                "id":        job_id,
-                "company":   company,
                 "title":     title,
+                "company":   company,
                 "location":  location,
-                "url":       redirect_url,
-                "salary":    parse_salary(r),
-                "desc":      desc[:250].replace("\n", " ").strip(),
+                "url":       url,
+                "salary":    "Competitive",   # LinkedIn rarely shows salary publicly
+                "age":       age,
+                "age_label": days_label(age),
                 "highlight": is_target_company(company),
-                "posted":    created,
             })
-        print(f"    → {added} relevant out of {len(results)} results")
 
-    # Sort: target companies first, then by most recent posting date
-    all_jobs.sort(key=lambda j: (not j["highlight"], j["posted"]), reverse=False)
-    all_jobs.sort(key=lambda j: not j["highlight"])   # keep highlights at top
+    # Sort: target companies first, then by recency
+    all_jobs.sort(key=lambda j: (
+        not j["highlight"],
+        j["age"] if j["age"] is not None else 999
+    ))
 
-    # Deduplicate by (company + title) to avoid near-duplicates
-    seen_titles: set[str] = set()
-    deduped: list[dict] = []
-    for j in all_jobs:
-        key = f"{j['company'].lower()}|{j['title'].lower()[:40]}"
-        if key not in seen_titles:
-            seen_titles.add(key)
-            deduped.append(j)
-
-    result = deduped[:MAX_JOBS_IN_EMAIL]
-    print(f"Total: {len(result)} jobs (from {len(all_jobs)} before dedup/cap)")
+    result = all_jobs[:MAX_JOBS_IN_EMAIL]
+    print(f"Total after filter: {len(result)} jobs")
     return result
 
 
 # ── Build HTML email ───────────────────────────────────────────────────────────
 
-def job_card_html(j: dict) -> str:
-    border  = "border-left:3px solid #185FA5;" if j["highlight"] else ""
-    co_bg   = "#E6F1FB" if j["highlight"] else "#f0f0ec"
-    co_col  = "#185FA5" if j["highlight"] else "#555"
+def age_badge(label: str, age) -> str:
+    if age == 0:
+        bg, col = "#EAF3DE", "#3B6D11"   # green = today
+    elif age == 1:
+        bg, col = "#E6F1FB", "#185FA5"   # blue = yesterday
+    else:
+        bg, col = "#FFF8E6", "#9A6B00"   # yellow = 2-3 days
 
-    # Format posted date nicely
-    posted_label = ""
-    if j["posted"]:
-        try:
-            dt = datetime.date.fromisoformat(j["posted"])
-            delta = (datetime.date.today() - dt).days
-            if delta == 0:
-                posted_label = "today"
-            elif delta == 1:
-                posted_label = "yesterday"
-            else:
-                posted_label = f"{delta}d ago"
-        except Exception:
-            posted_label = j["posted"]
-
-    posted_html = (
-        f'<span style="background:#FFF8E6;color:#9A6B00;font-size:11px;'
-        f'padding:1px 7px;border-radius:4px;font-weight:600;">🕐 {posted_label}</span>'
-        if posted_label else ""
+    return (
+        f'<span style="background:{bg};color:{col};font-size:11px;'
+        f'padding:1px 7px;border-radius:4px;font-weight:600;">🕐 {label}</span>'
     )
+
+
+def job_card_html(j: dict) -> str:
+    border = "border-left:3px solid #185FA5;" if j["highlight"] else ""
+    co_bg  = "#E6F1FB" if j["highlight"] else "#f0f0ec"
+    co_col = "#185FA5" if j["highlight"] else "#555"
 
     return f"""
 <div style="background:#fff;border:1px solid #e8e8e4;border-radius:8px;
@@ -211,17 +330,12 @@ def job_card_html(j: dict) -> str:
       {j['company']}
     </span>
   </div>
-  <div style="font-size:12px;color:#666;margin-bottom:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+  <div style="font-size:12px;color:#666;margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
     <span>📍 {j['location']}</span>
-    <span style="background:#EAF3DE;color:#3B6D11;padding:1px 7px;
-                 border-radius:4px;font-weight:600;">{j['salary']}</span>
-    {posted_html}
-  </div>
-  <div style="font-size:12px;color:#777;margin-bottom:8px;line-height:1.5;">
-    {j['desc']}{'…' if j['desc'] else ''}
+    {age_badge(j['age_label'], j['age'])}
   </div>
   <a href="{j['url']}" style="font-size:12px;color:#185FA5;text-decoration:none;font-weight:500;">
-    Apply →
+    View on LinkedIn →
   </a>
 </div>"""
 
@@ -230,9 +344,10 @@ def build_email_html(jobs: list[dict], date_str: str) -> str:
     total      = len(jobs)
     highlights = sum(1 for j in jobs if j["highlight"])
     companies  = len({j["company"] for j in jobs})
+    today_count = sum(1 for j in jobs if j["age"] == 0)
 
     body = "".join(job_card_html(j) for j in jobs) if jobs else (
-        "<p style='color:#888;padding:20px 0;'>No matching listings found today. Will retry tomorrow.</p>"
+        "<p style='color:#888;padding:20px 0;'>No fresh listings found today (≤3 days old). Will retry tomorrow.</p>"
     )
 
     return f"""<!DOCTYPE html>
@@ -250,8 +365,8 @@ def build_email_html(jobs: list[dict], date_str: str) -> str:
         🔔 Backend Engineer Roles
       </div>
       <div style="font-size:13px;color:#aaa;">
-        {date_str} &nbsp;·&nbsp; {total} listings &nbsp;·&nbsp;
-        {highlights} MNC/target &nbsp;·&nbsp; {companies} companies
+        {date_str} &nbsp;·&nbsp; {total} fresh listings &nbsp;·&nbsp;
+        {today_count} posted today &nbsp;·&nbsp; {highlights} MNC
       </div>
     </div>
 
@@ -268,17 +383,16 @@ def build_email_html(jobs: list[dict], date_str: str) -> str:
       </div>
     </div>
 
-    <!-- Legend -->
-    <div style="font-size:11px;color:#888;margin-bottom:10px;display:flex;gap:14px;flex-wrap:wrap;">
+    <div style="font-size:11px;color:#888;margin-bottom:12px;display:flex;gap:14px;flex-wrap:wrap;">
       <span>🔵 Blue border = MNC / target company</span>
-      <span>🕐 Yellow badge = how recently posted</span>
+      <span>🟢 Green badge = posted today &nbsp; 🔵 Blue = yesterday &nbsp; 🟡 Yellow = 2–3 days</span>
     </div>
 
     {body}
 
     <div style="margin-top:20px;padding-top:14px;border-top:1px solid #e8e8e4;
                 font-size:11px;color:#aaa;text-align:center;">
-      Automated · GitHub Actions · Adzuna API · Sorted by most recent · 7 AM IST daily
+      Source: LinkedIn Jobs · Only listings ≤3 days old · MNCs highlighted · 7 AM IST daily
     </div>
   </div>
 </body>
@@ -293,7 +407,7 @@ def send_email(html_body: str, date_str: str):
     recipient = os.environ["RECIPIENT_EMAIL"]
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🔔 Daily Job Digest — Backend Engineer Roles ({date_str})"
+    msg["Subject"] = f"🔔 Job Digest — Fresh Backend Roles (≤3 days) · {date_str}"
     msg["From"]    = f"Job Alert <{sender}>"
     msg["To"]      = recipient
     msg.attach(MIMEText(html_body, "html"))
@@ -310,7 +424,7 @@ def send_email(html_body: str, date_str: str):
 def main():
     date_str = datetime.date.today().strftime("%d %B %Y")
     print(f"=== Job Alert — {date_str} ===")
-    print("Fetching jobs from Adzuna...")
+    print("Scraping LinkedIn Jobs (last 3 days only)...")
     jobs = fetch_jobs()
     print("Building email...")
     html = build_email_html(jobs, date_str)
