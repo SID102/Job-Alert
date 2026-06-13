@@ -1,15 +1,17 @@
 """
 Daily Job Alert — Siddharth Singh
-Scrapes fresh job listings directly from LinkedIn Jobs public search
-(no login required), filters for relevance and recency (≤3 days),
-sends a styled digest via Gmail SMTP.
+Sources:
+  1. Remotive API       — free, no key, tech jobs globally (many India/remote)
+  2. Himalayas API      — free, no key, great for senior tech roles
+  3. The Muse API       — free, no key, good MNC coverage
+  4. Arbeitnow RSS      — free, no key, fresh listings daily
+
+All sources are public APIs — no scraping, no auth, works from GitHub Actions.
 
 Required GitHub Actions secrets:
-  GMAIL_ADDRESS       — your Gmail address
-  GMAIL_APP_PASSWORD  — 16-char Gmail App Password
-  RECIPIENT_EMAIL     — where to deliver the digest
-
-NO external API keys needed.
+  GMAIL_ADDRESS       — your Gmail
+  GMAIL_APP_PASSWORD  — 16-char App Password
+  RECIPIENT_EMAIL     — delivery address
 """
 
 import os
@@ -19,11 +21,9 @@ import datetime
 import urllib.request
 import urllib.parse
 import urllib.error
-import time
-import re
+import xml.etree.ElementTree as ET
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from html.parser import HTMLParser
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -32,281 +32,272 @@ CANDIDATE_PROFILE = {
     "stack": "Java · Kafka · Cassandra · Spark · Spring Boot · Kubernetes",
 }
 
-# LinkedIn job search queries — each maps to one search URL
-# f=TPR_1&f_TPR=r259200  → posted in last 3 days (259200 seconds)
-# f_E=4  → Associate + Mid-Senior level
-# f_JT=F → Full-time only
+RELEVANT_KEYWORDS = [
+    "java", "kafka", "cassandra", "spark", "backend", "distributed",
+    "spring boot", "spring", "microservice", "kubernetes", "k8s",
+    "streaming", "platform engineer", "software engineer", "sde", "swe",
+    "data engineer", "scala", "flink", "data platform",
+]
 
-LINKEDIN_SEARCHES = [
-    {
-        "label": "Backend Engineer India",
-        "url": (
-            "https://www.linkedin.com/jobs/search/?keywords=backend+engineer+java+kafka"
-            "&location=India&f_TPR=r259200&f_JT=F&f_E=4&sortBy=DD"
-        ),
-    },
-    {
-        "label": "Distributed Systems India",
-        "url": (
-            "https://www.linkedin.com/jobs/search/?keywords=distributed+systems+engineer+java"
-            "&location=India&f_TPR=r259200&f_JT=F&f_E=4&sortBy=DD"
-        ),
-    },
-    {
-        "label": "Senior SWE Kafka India",
-        "url": (
-            "https://www.linkedin.com/jobs/search/?keywords=senior+software+engineer+kafka+java"
-            "&location=India&f_TPR=r259200&f_JT=F&f_E=4&sortBy=DD"
-        ),
-    },
-    {
-        "label": "Platform Engineer Kafka India",
-        "url": (
-            "https://www.linkedin.com/jobs/search/?keywords=platform+engineer+kafka+kubernetes"
-            "&location=India&f_TPR=r259200&f_JT=F&sortBy=DD"
-        ),
-    },
-    {
-        "label": "Java Spring Boot Senior India",
-        "url": (
-            "https://www.linkedin.com/jobs/search/?keywords=senior+java+developer+spring+boot"
-            "&location=India&f_TPR=r259200&f_JT=F&f_E=4&sortBy=DD"
-        ),
-    },
+# Skip these — too junior or irrelevant
+EXCLUDE_TITLE_KEYWORDS = [
+    "intern", "trainee", "junior", "fresher", "frontend", "react",
+    "angular", "vue", "ios", "android", "mobile", "designer", "qa ",
+    "test engineer", "manual", "sales", "marketing", "hr ",
 ]
 
 TARGET_COMPANIES = [
     "google", "microsoft", "amazon", "aws", "uber", "flipkart", "phonepe",
     "razorpay", "cred", "swiggy", "confluent", "databricks", "zepto",
     "meesho", "zomato", "atlassian", "adobe", "salesforce", "goldman sachs",
-    "jp morgan", "morgan stanley", "deutsche bank", "paypal", "linkedin",
-    "meta", "apple", "netflix", "airbnb", "stripe", "walmart", "visa",
-    "mastercard", "barclays", "hsbc", "thoughtworks", "oracle", "sap",
-    "bytedance", "groww", "slice", "navi", "smallcase", "browserstack",
-    "postman", "freshworks", "zoho", "chargebee", "clevertap", "lenskart",
+    "jp morgan", "morgan stanley", "paypal", "linkedin", "meta", "apple",
+    "netflix", "airbnb", "stripe", "walmart", "visa", "mastercard",
+    "barclays", "hsbc", "thoughtworks", "oracle", "sap", "bytedance",
+    "groww", "slice", "smallcase", "browserstack", "postman", "freshworks",
+    "zoho", "chargebee", "clevertap", "lenskart", "twilio", "cloudflare",
+    "hashicorp", "datadog", "elastic", "mongodb", "redis", "cockroachdb",
 ]
 
-EXCLUDE_COMPANY_KEYWORDS = [
-    "consultancy", "consulting", "recruiter", "staffing", "solutions pvt",
-    "manpower", "hiring", "placement", "talent", "ventures pvt", "infotech",
-    "technologies pvt", "softwares", "it services",
-]
+MAX_AGE_DAYS = 7       # jobs older than this are skipped
+MAX_JOBS_EMAIL = 25
 
-MAX_JOBS_IN_EMAIL = 20
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-# ── LinkedIn Scraper ───────────────────────────────────────────────────────────
-
-class JobCardParser(HTMLParser):
-    """Parse LinkedIn job search results page to extract job cards."""
-
-    def __init__(self):
-        super().__init__()
-        self.jobs: list[dict] = []
-        self._current: dict = {}
-        self._capture_field: str | None = None
-        self._depth = 0
-        self._in_card = False
-
-    def handle_starttag(self, tag, attrs):
-        attrs_dict = dict(attrs)
-        classes = attrs_dict.get("class", "")
-
-        # Detect job card containers
-        if tag == "li" and "base-card" in classes:
-            self._current = {}
-            self._in_card = True
-
-        if not self._in_card:
-            return
-
-        # Job title link
-        if tag == "a" and "base-card__full-link" in classes:
-            href = attrs_dict.get("href", "")
-            if href:
-                self._current["url"] = href.split("?")[0]
-
-        if tag == "h3" and "base-search-card__title" in classes:
-            self._capture_field = "title"
-
-        if tag == "h4" and "base-search-card__subtitle" in classes:
-            self._capture_field = "company"
-
-        if tag == "span" and "job-search-card__location" in classes:
-            self._capture_field = "location"
-
-        if tag == "time":
-            self._current["posted_raw"] = attrs_dict.get("datetime", "")
-            self._capture_field = "posted_label"
-
-    def handle_data(self, data):
-        if self._capture_field:
-            existing = self._current.get(self._capture_field, "")
-            self._current[self._capture_field] = (existing + data).strip()
-
-    def handle_endtag(self, tag):
-        if tag in ("h3", "h4", "span", "time"):
-            self._capture_field = None
-
-        if tag == "li" and self._in_card and self._current.get("title"):
-            self.jobs.append(dict(self._current))
-            self._current = {}
-            self._in_card = False
-
-
-def scrape_linkedin(search_url: str, label: str) -> list[dict]:
-    """Fetch and parse a LinkedIn jobs search page."""
-    req = urllib.request.Request(search_url, headers=HEADERS)
+def fetch_url(url: str, timeout: int = 20) -> str | None:
+    headers = {
+        "User-Agent": "JobAlertBot/2.0 (personal job digest)",
+        "Accept": "application/json, text/html, application/rss+xml",
+    }
+    req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-    except urllib.error.HTTPError as e:
-        print(f"  HTTP {e.code} for '{label}'")
-        return []
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
-        print(f"  Error for '{label}': {e}")
-        return []
-
-    parser = JobCardParser()
-    parser.feed(html)
-
-    if not parser.jobs:
-        # Fallback: extract from embedded JSON (LinkedIn sometimes renders this way)
-        jobs = extract_from_json_ld(html)
-        print(f"  '{label}': {len(jobs)} jobs (via JSON fallback)")
-        return jobs
-
-    print(f"  '{label}': {len(parser.jobs)} jobs parsed")
-    return parser.jobs
+        print(f"  Fetch error [{url[:60]}]: {e}")
+        return None
 
 
-def extract_from_json_ld(html: str) -> list[dict]:
-    """Try to extract jobs from JSON-LD embedded in the page."""
-    jobs = []
-    matches = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL)
-    for match in matches:
+def parse_date(date_str: str) -> datetime.date | None:
+    if not date_str:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%a, %d %b %Y %H:%M:%S %z",
+                "%a, %d %b %Y %H:%M:%S GMT"):
         try:
-            data = json.loads(match)
-            if isinstance(data, dict) and data.get("@type") == "JobPosting":
-                jobs.append({
-                    "title":       data.get("title", ""),
-                    "company":     data.get("hiringOrganization", {}).get("name", ""),
-                    "location":    data.get("jobLocation", {}).get("address", {}).get("addressLocality", "India"),
-                    "url":         data.get("url", "#"),
-                    "posted_raw":  data.get("datePosted", ""),
-                    "posted_label": "",
-                })
+            return datetime.datetime.strptime(date_str[:25], fmt[:len(date_str[:25])]).date()
         except Exception:
             pass
-    return jobs
-
-
-# ── Filtering & Processing ─────────────────────────────────────────────────────
-
-def is_consultancy(company: str) -> bool:
-    c = company.lower()
-    return any(kw in c for kw in EXCLUDE_COMPANY_KEYWORDS)
-
-
-def is_target_company(company: str) -> bool:
-    return any(t in company.lower() for t in TARGET_COMPANIES)
-
-
-def days_ago(posted_raw: str) -> int | None:
-    """Return how many days ago the job was posted, or None if unknown."""
-    if not posted_raw:
-        return None
     try:
-        dt = datetime.date.fromisoformat(posted_raw[:10])
-        return (datetime.date.today() - dt).days
+        return datetime.date.fromisoformat(date_str[:10])
     except Exception:
         return None
 
 
-def days_label(d: int | None) -> str:
-    if d is None:
-        return "recently"
-    if d == 0:
-        return "today"
-    if d == 1:
-        return "yesterday"
-    return f"{d}d ago"
+def days_ago(dt: datetime.date | None) -> int | None:
+    if dt is None:
+        return None
+    return (datetime.date.today() - dt).days
 
+
+def is_relevant(title: str, desc: str = "") -> bool:
+    text = (title + " " + desc).lower()
+    if any(k in text for k in EXCLUDE_TITLE_KEYWORDS):
+        return False
+    return any(k in text for k in RELEVANT_KEYWORDS)
+
+
+def is_target(company: str) -> bool:
+    return any(t in company.lower() for t in TARGET_COMPANIES)
+
+
+def make_job(title, company, location, url, posted_date, source, desc="") -> dict:
+    age = days_ago(posted_date)
+    return {
+        "title":     title.strip(),
+        "company":   company.strip(),
+        "location":  location.strip() if location else "Remote / India",
+        "url":       url.strip(),
+        "source":    source,
+        "age":       age,
+        "desc":      desc[:200].replace("\n", " ").strip(),
+        "highlight": is_target(company),
+    }
+
+# ── Source 1: Remotive API ─────────────────────────────────────────────────────
+
+def fetch_remotive() -> list[dict]:
+    jobs = []
+    for tag in ["software-dev", "backend", "devops-sysadmin", "data"]:
+        url = f"https://remotive.com/api/remote-jobs?category={tag}&limit=50"
+        raw = fetch_url(url)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+            for r in data.get("jobs", []):
+                title   = r.get("title", "")
+                company = r.get("company_name", "")
+                loc     = r.get("candidate_required_location", "Worldwide")
+                link    = r.get("url", "#")
+                pub     = parse_date(r.get("publication_date", ""))
+                desc    = r.get("description", "")[:300]
+
+                if not is_relevant(title, desc):
+                    continue
+                age = days_ago(pub)
+                if age is not None and age > MAX_AGE_DAYS:
+                    continue
+
+                jobs.append(make_job(title, company, loc, link, pub, "Remotive", desc))
+        except Exception as e:
+            print(f"  Remotive parse error: {e}")
+
+    print(f"  Remotive: {len(jobs)} relevant jobs")
+    return jobs
+
+# ── Source 2: Himalayas API ────────────────────────────────────────────────────
+
+def fetch_himalayas() -> list[dict]:
+    jobs = []
+    queries = ["java backend", "kafka engineer", "distributed systems", "platform engineer java"]
+    for q in queries:
+        url = f"https://himalayas.app/jobs/api?q={urllib.parse.quote(q)}&limit=20"
+        raw = fetch_url(url)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+            for r in data.get("jobs", []):
+                title   = r.get("title", "")
+                company = r.get("companyName", "") or r.get("company", {}).get("name", "")
+                loc     = r.get("location", "Remote")
+                link    = r.get("applicationLink", "") or r.get("url", "#")
+                pub     = parse_date(r.get("createdAt", "") or r.get("publishedAt", ""))
+                desc    = r.get("description", "")[:300]
+
+                if not is_relevant(title, desc):
+                    continue
+                age = days_ago(pub)
+                if age is not None and age > MAX_AGE_DAYS:
+                    continue
+
+                jobs.append(make_job(title, company, loc, link, pub, "Himalayas", desc))
+        except Exception as e:
+            print(f"  Himalayas parse error ({q}): {e}")
+
+    print(f"  Himalayas: {len(jobs)} relevant jobs")
+    return jobs
+
+# ── Source 3: Arbeitnow RSS (fresh, daily updated) ────────────────────────────
+
+def fetch_arbeitnow() -> list[dict]:
+    jobs = []
+    url = "https://www.arbeitnow.com/api/job-board-api"
+    raw = fetch_url(url)
+    if not raw:
+        return jobs
+    try:
+        data = json.loads(raw)
+        for r in data.get("data", []):
+            title   = r.get("title", "")
+            company = r.get("company_name", "")
+            loc     = r.get("location", "Remote")
+            link    = r.get("url", "#")
+            pub     = parse_date(r.get("created_at", ""))
+            desc    = r.get("description", "")[:300]
+            tags    = " ".join(r.get("tags", []))
+
+            if not is_relevant(title, desc + " " + tags):
+                continue
+            age = days_ago(pub)
+            if age is not None and age > MAX_AGE_DAYS:
+                continue
+
+            jobs.append(make_job(title, company, loc, link, pub, "Arbeitnow", desc))
+    except Exception as e:
+        print(f"  Arbeitnow parse error: {e}")
+
+    print(f"  Arbeitnow: {len(jobs)} relevant jobs")
+    return jobs
+
+# ── Source 4: The Muse API (MNC heavy) ────────────────────────────────────────
+
+def fetch_themuse() -> list[dict]:
+    jobs = []
+    for page in [1, 2]:
+        url = (
+            f"https://www.themuse.com/api/public/jobs"
+            f"?category=Software+Engineer&category=Data+Science&level=Senior+Level"
+            f"&level=Mid+Level&page={page}&api_key=public"
+        )
+        raw = fetch_url(url)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+            for r in data.get("results", []):
+                title   = r.get("name", "")
+                company = r.get("company", {}).get("name", "")
+                locs    = r.get("locations", [{}])
+                loc     = locs[0].get("name", "Remote") if locs else "Remote"
+                link    = r.get("refs", {}).get("landing_page", "#")
+                pub     = parse_date(r.get("publication_date", ""))
+                desc    = r.get("contents", "")[:300]
+
+                if not is_relevant(title, desc):
+                    continue
+                age = days_ago(pub)
+                if age is not None and age > MAX_AGE_DAYS:
+                    continue
+
+                jobs.append(make_job(title, company, loc, link, pub, "The Muse", desc))
+        except Exception as e:
+            print(f"  TheMuse parse error: {e}")
+
+    print(f"  The Muse: {len(jobs)} relevant jobs")
+    return jobs
+
+# ── Aggregate & deduplicate ────────────────────────────────────────────────────
 
 def fetch_jobs() -> list[dict]:
-    seen_urls: set[str] = set()
-    seen_titles: set[str] = set()
+    print("Fetching from all sources...")
     all_jobs: list[dict] = []
+    all_jobs += fetch_remotive()
+    all_jobs += fetch_himalayas()
+    all_jobs += fetch_arbeitnow()
+    all_jobs += fetch_themuse()
 
-    for search in LINKEDIN_SEARCHES:
-        print(f"  Scraping: {search['label']}...")
-        raw = scrape_linkedin(search["url"], search["label"])
-        time.sleep(2)  # polite delay between requests
+    # Deduplicate by (company + title)
+    seen: set[str] = set()
+    deduped = []
+    for j in all_jobs:
+        key = f"{j['company'].lower()}|{j['title'].lower()[:50]}"
+        if key not in seen:
+            seen.add(key)
+            deduped.append(j)
 
-        for r in raw:
-            title   = r.get("title", "").strip()
-            company = r.get("company", "").strip()
-            url     = r.get("url", "#")
-            location = r.get("location", "India").strip()
-            posted_raw = r.get("posted_raw", "")
-
-            if not title or not company:
-                continue
-
-            # Dedup by URL or title+company
-            dedup_key = url if url != "#" else f"{company.lower()}|{title.lower()[:40]}"
-            if dedup_key in seen_urls:
-                continue
-            seen_urls.add(dedup_key)
-
-            # Skip consultancies/staffing firms
-            if is_consultancy(company):
-                continue
-
-            # Skip jobs older than 3 days
-            age = days_ago(posted_raw)
-            if age is not None and age > 3:
-                continue
-
-            all_jobs.append({
-                "title":     title,
-                "company":   company,
-                "location":  location,
-                "url":       url,
-                "salary":    "Competitive",   # LinkedIn rarely shows salary publicly
-                "age":       age,
-                "age_label": days_label(age),
-                "highlight": is_target_company(company),
-            })
-
-    # Sort: target companies first, then by recency
-    all_jobs.sort(key=lambda j: (
+    # Sort: MNCs first, then by recency
+    deduped.sort(key=lambda j: (
         not j["highlight"],
         j["age"] if j["age"] is not None else 999
     ))
 
-    result = all_jobs[:MAX_JOBS_IN_EMAIL]
-    print(f"Total after filter: {len(result)} jobs")
+    result = deduped[:MAX_JOBS_EMAIL]
+    print(f"Total: {len(result)} jobs after dedup (from {len(all_jobs)} raw)")
     return result
 
+# ── HTML email ─────────────────────────────────────────────────────────────────
 
-# ── Build HTML email ───────────────────────────────────────────────────────────
-
-def age_badge(label: str, age) -> str:
-    if age == 0:
-        bg, col = "#EAF3DE", "#3B6D11"   # green = today
+def age_badge(age) -> str:
+    if age is None:
+        label, bg, col = "recently", "#f0f0ec", "#666"
+    elif age == 0:
+        label, bg, col = "today",     "#EAF3DE", "#3B6D11"
     elif age == 1:
-        bg, col = "#E6F1FB", "#185FA5"   # blue = yesterday
+        label, bg, col = "yesterday", "#E6F1FB", "#185FA5"
+    elif age <= 3:
+        label, bg, col = f"{age}d ago","#FFF8E6", "#9A6B00"
     else:
-        bg, col = "#FFF8E6", "#9A6B00"   # yellow = 2-3 days
+        label, bg, col = f"{age}d ago","#f0f0ec", "#666"
 
     return (
         f'<span style="background:{bg};color:{col};font-size:11px;'
@@ -314,10 +305,25 @@ def age_badge(label: str, age) -> str:
     )
 
 
+def source_badge(source: str) -> str:
+    colors = {
+        "Remotive":  ("#f5f0ff", "#6B21A8"),
+        "Himalayas": ("#FFF0F0", "#9A1818"),
+        "Arbeitnow": ("#F0FFF4", "#166534"),
+        "The Muse":  ("#FFF8E6", "#9A6B00"),
+    }
+    bg, col = colors.get(source, ("#f0f0ec", "#555"))
+    return (
+        f'<span style="background:{bg};color:{col};font-size:10px;'
+        f'padding:1px 6px;border-radius:4px;font-weight:500;">{source}</span>'
+    )
+
+
 def job_card_html(j: dict) -> str:
     border = "border-left:3px solid #185FA5;" if j["highlight"] else ""
     co_bg  = "#E6F1FB" if j["highlight"] else "#f0f0ec"
     co_col = "#185FA5" if j["highlight"] else "#555"
+    desc_html = f'<div style="font-size:12px;color:#777;margin-bottom:8px;line-height:1.5;">{j["desc"]}{"…" if j["desc"] else ""}</div>' if j["desc"] else ""
 
     return f"""
 <div style="background:#fff;border:1px solid #e8e8e4;border-radius:8px;
@@ -330,12 +336,14 @@ def job_card_html(j: dict) -> str:
       {j['company']}
     </span>
   </div>
-  <div style="font-size:12px;color:#666;margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+  <div style="font-size:12px;color:#666;margin-bottom:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
     <span>📍 {j['location']}</span>
-    {age_badge(j['age_label'], j['age'])}
+    {age_badge(j['age'])}
+    {source_badge(j['source'])}
   </div>
+  {desc_html}
   <a href="{j['url']}" style="font-size:12px;color:#185FA5;text-decoration:none;font-weight:500;">
-    View on LinkedIn →
+    View &amp; Apply →
   </a>
 </div>"""
 
@@ -343,39 +351,29 @@ def job_card_html(j: dict) -> str:
 def build_email_html(jobs: list[dict], date_str: str) -> str:
     total      = len(jobs)
     highlights = sum(1 for j in jobs if j["highlight"])
-    companies  = len({j["company"] for j in jobs})
     today_count = sum(1 for j in jobs if j["age"] == 0)
-
     body = "".join(job_card_html(j) for j in jobs) if jobs else (
-        "<p style='color:#888;padding:20px 0;'>No fresh listings found today (≤3 days old). Will retry tomorrow.</p>"
+        "<p style='color:#888;padding:20px 0;'>No matching fresh listings found today. Will retry tomorrow.</p>"
     )
 
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f5f4f0;
-             font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+<body style="margin:0;padding:0;background:#f5f4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
   <div style="max-width:620px;margin:32px auto;padding:0 16px 40px;">
 
     <div style="background:#1a1a1a;border-radius:10px;padding:24px 28px;margin-bottom:14px;">
-      <div style="font-size:11px;color:#888;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:4px;">
-        Daily Job Digest
-      </div>
-      <div style="font-size:22px;font-weight:700;color:#fff;margin-bottom:4px;">
-        🔔 Backend Engineer Roles
-      </div>
+      <div style="font-size:11px;color:#888;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:4px;">Daily Job Digest</div>
+      <div style="font-size:22px;font-weight:700;color:#fff;margin-bottom:4px;">🔔 Backend Engineer Roles</div>
       <div style="font-size:13px;color:#aaa;">
-        {date_str} &nbsp;·&nbsp; {total} fresh listings &nbsp;·&nbsp;
-        {today_count} posted today &nbsp;·&nbsp; {highlights} MNC
+        {date_str} &nbsp;·&nbsp; {total} listings &nbsp;·&nbsp; {today_count} posted today &nbsp;·&nbsp; {highlights} MNC
       </div>
     </div>
 
-    <div style="background:#fff;border:1px solid #e8e8e4;border-radius:8px;
-                padding:12px 18px;margin-bottom:14px;">
+    <div style="background:#fff;border:1px solid #e8e8e4;border-radius:8px;padding:12px 18px;margin-bottom:14px;">
       <div style="display:flex;align-items:center;gap:12px;">
-        <div style="width:38px;height:38px;border-radius:50%;background:#E6F1FB;
-                    display:flex;align-items:center;justify-content:center;
-                    font-weight:700;font-size:13px;color:#185FA5;flex-shrink:0;">SS</div>
+        <div style="width:38px;height:38px;border-radius:50%;background:#E6F1FB;display:flex;align-items:center;
+                    justify-content:center;font-weight:700;font-size:13px;color:#185FA5;flex-shrink:0;">SS</div>
         <div>
           <div style="font-size:13px;font-weight:600;color:#1a1a1a;">Siddharth Singh</div>
           <div style="font-size:11px;color:#888;">{CANDIDATE_PROFILE['stack']}</div>
@@ -383,39 +381,34 @@ def build_email_html(jobs: list[dict], date_str: str) -> str:
       </div>
     </div>
 
-    <div style="font-size:11px;color:#888;margin-bottom:12px;display:flex;gap:14px;flex-wrap:wrap;">
-      <span>🔵 Blue border = MNC / target company</span>
-      <span>🟢 Green badge = posted today &nbsp; 🔵 Blue = yesterday &nbsp; 🟡 Yellow = 2–3 days</span>
+    <div style="font-size:11px;color:#888;margin-bottom:12px;">
+      🔵 Blue border = MNC &nbsp;·&nbsp; 🟢 Green = today &nbsp;·&nbsp; 🔵 Blue = yesterday &nbsp;·&nbsp; 🟡 Yellow = 2–7d
     </div>
 
     {body}
 
-    <div style="margin-top:20px;padding-top:14px;border-top:1px solid #e8e8e4;
-                font-size:11px;color:#aaa;text-align:center;">
-      Source: LinkedIn Jobs · Only listings ≤3 days old · MNCs highlighted · 7 AM IST daily
+    <div style="margin-top:20px;padding-top:14px;border-top:1px solid #e8e8e4;font-size:11px;color:#aaa;text-align:center;">
+      Sources: Remotive · Himalayas · Arbeitnow · The Muse &nbsp;·&nbsp; MNCs first · ≤7 days old · 7 AM IST daily
     </div>
   </div>
 </body>
 </html>"""
 
 
-# ── Send via Gmail SMTP ────────────────────────────────────────────────────────
+# ── Gmail send ─────────────────────────────────────────────────────────────────
 
 def send_email(html_body: str, date_str: str):
     sender    = os.environ["GMAIL_ADDRESS"]
     password  = os.environ["GMAIL_APP_PASSWORD"]
     recipient = os.environ["RECIPIENT_EMAIL"]
-
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🔔 Job Digest — Fresh Backend Roles (≤3 days) · {date_str}"
+    msg["Subject"] = f"🔔 Job Digest — Backend Roles · {date_str}"
     msg["From"]    = f"Job Alert <{sender}>"
     msg["To"]      = recipient
     msg.attach(MIMEText(html_body, "html"))
-
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(sender, password)
         server.sendmail(sender, recipient, msg.as_string())
-
     print(f"Email sent → {recipient}")
 
 
@@ -424,11 +417,8 @@ def send_email(html_body: str, date_str: str):
 def main():
     date_str = datetime.date.today().strftime("%d %B %Y")
     print(f"=== Job Alert — {date_str} ===")
-    print("Scraping LinkedIn Jobs (last 3 days only)...")
     jobs = fetch_jobs()
-    print("Building email...")
     html = build_email_html(jobs, date_str)
-    print("Sending email...")
     send_email(html, date_str)
     print("Done ✓")
 
