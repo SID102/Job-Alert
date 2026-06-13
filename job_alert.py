@@ -1,14 +1,15 @@
 """
 Daily Job Alert — Siddharth Singh
-Sources:
-  1. Remotive API       — free, no key, tech jobs globally (many India/remote)
-  2. Himalayas API      — free, no key, great for senior tech roles
-  3. The Muse API       — free, no key, good MNC coverage
-  4. Arbeitnow RSS      — free, no key, fresh listings daily
+Fetches jobs DIRECTLY from top MNC career portals using their
+public ATS APIs (Greenhouse, Lever, custom) — no scraping, no auth needed.
 
-All sources are public APIs — no scraping, no auth, works from GitHub Actions.
+Companies covered:
+  Greenhouse ATS : Uber, Confluent, Databricks, Atlassian, Razorpay,
+                   Swiggy, Meesho, BrowserStack, Postman, Freshworks
+  Lever ATS      : Razorpay (backup), CoinBase, Stripe
+  Custom APIs    : Google, Microsoft, Amazon
 
-Required GitHub Actions secrets:
+Required GitHub Actions secrets (same as before):
   GMAIL_ADDRESS       — your Gmail
   GMAIL_APP_PASSWORD  — 16-char App Password
   RECIPIENT_EMAIL     — delivery address
@@ -21,7 +22,7 @@ import datetime
 import urllib.request
 import urllib.parse
 import urllib.error
-import xml.etree.ElementTree as ET
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -32,62 +33,86 @@ CANDIDATE_PROFILE = {
     "stack": "Java · Kafka · Cassandra · Spark · Spring Boot · Kubernetes",
 }
 
+MAX_AGE_DAYS   = 7
+MAX_JOBS_EMAIL = 30
+
 RELEVANT_KEYWORDS = [
-    "java", "kafka", "cassandra", "spark", "backend", "distributed",
-    "spring boot", "spring", "microservice", "kubernetes", "k8s",
-    "streaming", "platform engineer", "software engineer", "sde", "swe",
-    "data engineer", "scala", "flink", "data platform",
+    "backend", "software engineer", "sde", "swe", "platform",
+    "distributed", "java", "kafka", "spark", "cassandra",
+    "data engineer", "infrastructure", "microservice", "kubernetes",
+    "streaming", "scala", "spring", "senior engineer", "staff engineer",
 ]
 
-# Skip these — too junior or irrelevant
-EXCLUDE_TITLE_KEYWORDS = [
-    "intern", "trainee", "junior", "fresher", "frontend", "react",
-    "angular", "vue", "ios", "android", "mobile", "designer", "qa ",
-    "test engineer", "manual", "sales", "marketing", "hr ",
+EXCLUDE_KEYWORDS = [
+    "intern", "frontend", "react", "ios", "android", "mobile",
+    "designer", "sales", "marketing", "recruiter", "hr", "legal",
+    "finance", "accounting", "junior", "manual qa", "test engineer",
 ]
 
-TARGET_COMPANIES = [
-    "google", "microsoft", "amazon", "aws", "uber", "flipkart", "phonepe",
-    "razorpay", "cred", "swiggy", "confluent", "databricks", "zepto",
-    "meesho", "zomato", "atlassian", "adobe", "salesforce", "goldman sachs",
-    "jp morgan", "morgan stanley", "paypal", "linkedin", "meta", "apple",
-    "netflix", "airbnb", "stripe", "walmart", "visa", "mastercard",
-    "barclays", "hsbc", "thoughtworks", "oracle", "sap", "bytedance",
-    "groww", "slice", "smallcase", "browserstack", "postman", "freshworks",
-    "zoho", "chargebee", "clevertap", "lenskart", "twilio", "cloudflare",
-    "hashicorp", "datadog", "elastic", "mongodb", "redis", "cockroachdb",
+# ── Company Configs ────────────────────────────────────────────────────────────
+
+# Greenhouse public API: https://boards-api.greenhouse.io/v1/boards/{slug}/jobs
+GREENHOUSE_COMPANIES = [
+    {"name": "Uber",          "slug": "uber",              "color": "#000000"},
+    {"name": "Confluent",     "slug": "confluent",         "color": "#E31837"},
+    {"name": "Databricks",    "slug": "databricks",        "color": "#FF3621"},
+    {"name": "Atlassian",     "slug": "atlassian",         "color": "#0052CC"},
+    {"name": "Swiggy",        "slug": "swiggy",            "color": "#FC8019"},
+    {"name": "BrowserStack",  "slug": "browserstack",      "color": "#FF6C37"},
+    {"name": "Postman",       "slug": "postman",           "color": "#FF6C37"},
+    {"name": "Freshworks",    "slug": "freshworks",        "color": "#25C16F"},
+    {"name": "Meesho",        "slug": "meesho",            "color": "#9B3DE8"},
+    {"name": "Razorpay",      "slug": "razorpay",          "color": "#3395FF"},
+    {"name": "CRED",          "slug": "dreamplug",         "color": "#1A1A1A"},
+    {"name": "Groww",         "slug": "groww",             "color": "#00D09C"},
+    {"name": "Zomato",        "slug": "zomato",            "color": "#E23744"},
+    {"name": "PhonePe",       "slug": "phonepe",           "color": "#5F259F"},
+    {"name": "Zepto",         "slug": "zepto",             "color": "#8B1A1A"},
+    {"name": "Stripe",        "slug": "stripe",            "color": "#635BFF"},
+    {"name": "Cloudflare",    "slug": "cloudflare",        "color": "#F48120"},
+    {"name": "HashiCorp",     "slug": "hashicorp",         "color": "#7B42BC"},
+    {"name": "Datadog",       "slug": "datadog",           "color": "#632CA6"},
+    {"name": "Figma",         "slug": "figma",             "color": "#1ABCFE"},
 ]
 
-MAX_AGE_DAYS = 7       # jobs older than this are skipped
-MAX_JOBS_EMAIL = 25
+# Lever public API: https://api.lever.co/v0/postings/{slug}?mode=json
+LEVER_COMPANIES = [
+    {"name": "Coinbase",      "slug": "coinbase",          "color": "#0052FF"},
+    {"name": "Gojek",         "slug": "gojek",             "color": "#00AA13"},
+    {"name": "Chargebee",     "slug": "chargebee",         "color": "#F5A623"},
+    {"name": "CleverTap",     "slug": "clevertap",         "color": "#FF6B35"},
+    {"name": "Smallcase",     "slug": "smallcase",         "color": "#19A68A"},
+]
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def fetch_url(url: str, timeout: int = 20) -> str | None:
-    headers = {
-        "User-Agent": "JobAlertBot/2.0 (personal job digest)",
-        "Accept": "application/json, text/html, application/rss+xml",
-    }
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 JobAlertBot/3.0",
+        "Accept": "application/json",
+    })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
-        print(f"  Fetch error [{url[:60]}]: {e}")
+        print(f"    Error [{url[:70]}]: {e}")
         return None
 
 
-def parse_date(date_str: str) -> datetime.date | None:
-    if not date_str:
+def parse_date(s: str) -> datetime.date | None:
+    if not s:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%a, %d %b %Y %H:%M:%S %z",
-                "%a, %d %b %Y %H:%M:%S GMT"):
+    # Handle Unix timestamps (milliseconds)
+    if isinstance(s, (int, float)) or (isinstance(s, str) and s.isdigit()):
         try:
-            return datetime.datetime.strptime(date_str[:25], fmt[:len(date_str[:25])]).date()
+            ts = int(s)
+            if ts > 1e10:
+                ts //= 1000
+            return datetime.date.fromtimestamp(ts)
         except Exception:
-            pass
+            return None
     try:
-        return datetime.date.fromisoformat(date_str[:10])
+        return datetime.date.fromisoformat(str(s)[:10])
     except Exception:
         return None
 
@@ -98,175 +123,285 @@ def days_ago(dt: datetime.date | None) -> int | None:
     return (datetime.date.today() - dt).days
 
 
-def is_relevant(title: str, desc: str = "") -> bool:
-    text = (title + " " + desc).lower()
-    if any(k in text for k in EXCLUDE_TITLE_KEYWORDS):
+def is_relevant(title: str, dept: str = "", location: str = "") -> bool:
+    text = (title + " " + dept + " " + location).lower()
+    if any(k in text for k in EXCLUDE_KEYWORDS):
         return False
     return any(k in text for k in RELEVANT_KEYWORDS)
 
 
-def is_target(company: str) -> bool:
-    return any(t in company.lower() for t in TARGET_COMPANIES)
+def is_india_or_remote(location: str) -> bool:
+    loc = location.lower()
+    return any(k in loc for k in [
+        "india", "bangalore", "bengaluru", "mumbai", "delhi",
+        "hyderabad", "pune", "chennai", "noida", "gurgaon",
+        "remote", "worldwide", "global", "anywhere",
+    ])
 
+# ── Greenhouse Fetcher ─────────────────────────────────────────────────────────
 
-def make_job(title, company, location, url, posted_date, source, desc="") -> dict:
-    age = days_ago(posted_date)
-    return {
-        "title":     title.strip(),
-        "company":   company.strip(),
-        "location":  location.strip() if location else "Remote / India",
-        "url":       url.strip(),
-        "source":    source,
-        "age":       age,
-        "desc":      desc[:200].replace("\n", " ").strip(),
-        "highlight": is_target(company),
-    }
+def fetch_greenhouse(company: dict) -> list[dict]:
+    slug = company["slug"]
+    name = company["name"]
+    url  = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
 
-# ── Source 1: Remotive API ─────────────────────────────────────────────────────
-
-def fetch_remotive() -> list[dict]:
-    jobs = []
-    for tag in ["software-dev", "backend", "devops-sysadmin", "data"]:
-        url = f"https://remotive.com/api/remote-jobs?category={tag}&limit=50"
-        raw = fetch_url(url)
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-            for r in data.get("jobs", []):
-                title   = r.get("title", "")
-                company = r.get("company_name", "")
-                loc     = r.get("candidate_required_location", "Worldwide")
-                link    = r.get("url", "#")
-                pub     = parse_date(r.get("publication_date", ""))
-                desc    = r.get("description", "")[:300]
-
-                if not is_relevant(title, desc):
-                    continue
-                age = days_ago(pub)
-                if age is not None and age > MAX_AGE_DAYS:
-                    continue
-
-                jobs.append(make_job(title, company, loc, link, pub, "Remotive", desc))
-        except Exception as e:
-            print(f"  Remotive parse error: {e}")
-
-    print(f"  Remotive: {len(jobs)} relevant jobs")
-    return jobs
-
-# ── Source 2: Himalayas API ────────────────────────────────────────────────────
-
-def fetch_himalayas() -> list[dict]:
-    jobs = []
-    queries = ["java backend", "kafka engineer", "distributed systems", "platform engineer java"]
-    for q in queries:
-        url = f"https://himalayas.app/jobs/api?q={urllib.parse.quote(q)}&limit=20"
-        raw = fetch_url(url)
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-            for r in data.get("jobs", []):
-                title   = r.get("title", "")
-                company = r.get("companyName", "") or r.get("company", {}).get("name", "")
-                loc     = r.get("location", "Remote")
-                link    = r.get("applicationLink", "") or r.get("url", "#")
-                pub     = parse_date(r.get("createdAt", "") or r.get("publishedAt", ""))
-                desc    = r.get("description", "")[:300]
-
-                if not is_relevant(title, desc):
-                    continue
-                age = days_ago(pub)
-                if age is not None and age > MAX_AGE_DAYS:
-                    continue
-
-                jobs.append(make_job(title, company, loc, link, pub, "Himalayas", desc))
-        except Exception as e:
-            print(f"  Himalayas parse error ({q}): {e}")
-
-    print(f"  Himalayas: {len(jobs)} relevant jobs")
-    return jobs
-
-# ── Source 3: Arbeitnow RSS (fresh, daily updated) ────────────────────────────
-
-def fetch_arbeitnow() -> list[dict]:
-    jobs = []
-    url = "https://www.arbeitnow.com/api/job-board-api"
     raw = fetch_url(url)
     if not raw:
-        return jobs
+        return []
+
     try:
         data = json.loads(raw)
-        for r in data.get("data", []):
-            title   = r.get("title", "")
-            company = r.get("company_name", "")
-            loc     = r.get("location", "Remote")
-            link    = r.get("url", "#")
-            pub     = parse_date(r.get("created_at", ""))
-            desc    = r.get("description", "")[:300]
-            tags    = " ".join(r.get("tags", []))
-
-            if not is_relevant(title, desc + " " + tags):
-                continue
-            age = days_ago(pub)
-            if age is not None and age > MAX_AGE_DAYS:
-                continue
-
-            jobs.append(make_job(title, company, loc, link, pub, "Arbeitnow", desc))
+        jobs_raw = data.get("jobs", [])
     except Exception as e:
-        print(f"  Arbeitnow parse error: {e}")
+        print(f"    {name}: parse error — {e}")
+        return []
 
-    print(f"  Arbeitnow: {len(jobs)} relevant jobs")
-    return jobs
+    results = []
+    for r in jobs_raw:
+        title    = r.get("title", "")
+        dept     = r.get("departments", [{}])[0].get("name", "") if r.get("departments") else ""
+        loc_list = r.get("offices", []) or r.get("location", {})
+        if isinstance(loc_list, list):
+            location = ", ".join(o.get("name", "") for o in loc_list if o.get("name"))
+        elif isinstance(loc_list, dict):
+            location = loc_list.get("name", "")
+        else:
+            location = ""
 
-# ── Source 4: The Muse API (MNC heavy) ────────────────────────────────────────
+        if not location:
+            location = "Remote"
 
-def fetch_themuse() -> list[dict]:
-    jobs = []
-    for page in [1, 2]:
-        url = (
-            f"https://www.themuse.com/api/public/jobs"
-            f"?category=Software+Engineer&category=Data+Science&level=Senior+Level"
-            f"&level=Mid+Level&page={page}&api_key=public"
-        )
+        # Greenhouse jobs without location filter — keep India + Remote
+        if not is_india_or_remote(location):
+            continue
+
+        if not is_relevant(title, dept, location):
+            continue
+
+        link     = r.get("absolute_url", "#")
+        pub_raw  = r.get("updated_at", "") or r.get("created_at", "")
+        pub_date = parse_date(pub_raw)
+        age      = days_ago(pub_date)
+
+        if age is not None and age > MAX_AGE_DAYS:
+            continue
+
+        results.append({
+            "company":  name,
+            "title":    title.strip(),
+            "location": location.strip(),
+            "dept":     dept,
+            "url":      link,
+            "age":      age,
+            "source":   "Greenhouse",
+            "color":    company["color"],
+        })
+
+    print(f"    {name}: {len(results)} matching jobs")
+    return results
+
+# ── Lever Fetcher ──────────────────────────────────────────────────────────────
+
+def fetch_lever(company: dict) -> list[dict]:
+    slug = company["slug"]
+    name = company["name"]
+    url  = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+
+    raw = fetch_url(url)
+    if not raw:
+        return []
+
+    try:
+        jobs_raw = json.loads(raw)
+        if not isinstance(jobs_raw, list):
+            jobs_raw = jobs_raw.get("data", [])
+    except Exception as e:
+        print(f"    {name}: parse error — {e}")
+        return []
+
+    results = []
+    for r in jobs_raw:
+        title    = r.get("text", "")
+        dept     = r.get("categories", {}).get("team", "")
+        location = r.get("categories", {}).get("location", "") or r.get("workplaceType", "Remote")
+        link     = r.get("hostedUrl", r.get("applyUrl", "#"))
+        pub_ts   = r.get("createdAt", 0)
+        pub_date = parse_date(str(pub_ts)) if pub_ts else None
+        age      = days_ago(pub_date)
+
+        if not is_india_or_remote(location):
+            continue
+        if not is_relevant(title, dept, location):
+            continue
+        if age is not None and age > MAX_AGE_DAYS:
+            continue
+
+        results.append({
+            "company":  name,
+            "title":    title.strip(),
+            "location": location.strip(),
+            "dept":     dept,
+            "url":      link,
+            "age":      age,
+            "source":   "Lever",
+            "color":    company["color"],
+        })
+
+    print(f"    {name}: {len(results)} matching jobs")
+    return results
+
+# ── Google Careers API ─────────────────────────────────────────────────────────
+
+def fetch_google() -> list[dict]:
+    results = []
+    queries = [
+        "backend engineer india",
+        "software engineer kafka india",
+        "platform engineer india",
+        "distributed systems india",
+    ]
+    for q in queries:
+        params = urllib.parse.urlencode({
+            "q": q,
+            "hl": "en",
+            "jlo": "en_IN",
+            "location": "India",
+        })
+        url = f"https://careers.google.com/api/jobs/jobs-v1/search/?{params}"
         raw = fetch_url(url)
         if not raw:
             continue
         try:
             data = json.loads(raw)
-            for r in data.get("results", []):
-                title   = r.get("name", "")
-                company = r.get("company", {}).get("name", "")
-                locs    = r.get("locations", [{}])
-                loc     = locs[0].get("name", "Remote") if locs else "Remote"
-                link    = r.get("refs", {}).get("landing_page", "#")
-                pub     = parse_date(r.get("publication_date", ""))
-                desc    = r.get("contents", "")[:300]
+            for r in data.get("jobs", []):
+                title    = r.get("title", "")
+                location = ", ".join(r.get("locations", ["India"]))
+                link     = "https://careers.google.com/jobs/results/" + str(r.get("id", ""))
+                pub_raw  = r.get("publish_date", "") or r.get("modified_date", "")
+                pub_date = parse_date(pub_raw)
+                age      = days_ago(pub_date)
 
-                if not is_relevant(title, desc):
+                if not is_india_or_remote(location):
                     continue
-                age = days_ago(pub)
+                if not is_relevant(title, "", location):
+                    continue
                 if age is not None and age > MAX_AGE_DAYS:
                     continue
 
-                jobs.append(make_job(title, company, loc, link, pub, "The Muse", desc))
+                results.append({
+                    "company":  "Google",
+                    "title":    title.strip(),
+                    "location": location.strip(),
+                    "dept":     "",
+                    "url":      link,
+                    "age":      age,
+                    "source":   "Google Careers",
+                    "color":    "#4285F4",
+                })
         except Exception as e:
-            print(f"  TheMuse parse error: {e}")
+            print(f"    Google query '{q}': {e}")
+        time.sleep(1)
 
-    print(f"  The Muse: {len(jobs)} relevant jobs")
-    return jobs
+    # Deduplicate Google jobs by title+location
+    seen = set()
+    deduped = []
+    for j in results:
+        k = j["title"].lower()[:40]
+        if k not in seen:
+            seen.add(k)
+            deduped.append(j)
 
-# ── Aggregate & deduplicate ────────────────────────────────────────────────────
+    print(f"    Google: {len(deduped)} matching jobs")
+    return deduped
+
+# ── Microsoft Careers API ──────────────────────────────────────────────────────
+
+def fetch_microsoft() -> list[dict]:
+    results = []
+    searches = [
+        "backend engineer",
+        "software engineer java",
+        "platform engineer",
+        "distributed systems",
+    ]
+    for q in searches:
+        params = urllib.parse.urlencode({
+            "q": q,
+            "l": "India",
+            "pg": 1,
+            "pgSz": 20,
+            "o": "Recent",
+            "flt": True,
+        })
+        url = f"https://gcsservices.careers.microsoft.com/search/api/v1/search?{params}"
+        raw = fetch_url(url)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+            jobs_raw = data.get("operationResult", {}).get("result", {}).get("jobs", [])
+            for r in jobs_raw:
+                title    = r.get("title", "")
+                location = r.get("primaryLocation", "India")
+                link     = f"https://jobs.careers.microsoft.com/global/en/job/{r.get('jobId', '')}"
+                pub_raw  = r.get("postingDate", "")
+                pub_date = parse_date(pub_raw)
+                age      = days_ago(pub_date)
+
+                if not is_india_or_remote(location):
+                    continue
+                if not is_relevant(title, "", ""):
+                    continue
+                if age is not None and age > MAX_AGE_DAYS:
+                    continue
+
+                results.append({
+                    "company":  "Microsoft",
+                    "title":    title.strip(),
+                    "location": location.strip(),
+                    "dept":     "",
+                    "url":      link,
+                    "age":      age,
+                    "source":   "Microsoft Careers",
+                    "color":    "#00A4EF",
+                })
+        except Exception as e:
+            print(f"    Microsoft query '{q}': {e}")
+        time.sleep(1)
+
+    seen = set()
+    deduped = []
+    for j in results:
+        k = j["title"].lower()[:40]
+        if k not in seen:
+            seen.add(k)
+            deduped.append(j)
+
+    print(f"    Microsoft: {len(deduped)} matching jobs")
+    return deduped
+
+# ── Aggregate all sources ──────────────────────────────────────────────────────
 
 def fetch_jobs() -> list[dict]:
-    print("Fetching from all sources...")
     all_jobs: list[dict] = []
-    all_jobs += fetch_remotive()
-    all_jobs += fetch_himalayas()
-    all_jobs += fetch_arbeitnow()
-    all_jobs += fetch_themuse()
 
-    # Deduplicate by (company + title)
+    print("→ Greenhouse companies...")
+    for company in GREENHOUSE_COMPANIES:
+        all_jobs += fetch_greenhouse(company)
+        time.sleep(0.5)
+
+    print("→ Lever companies...")
+    for company in LEVER_COMPANIES:
+        all_jobs += fetch_lever(company)
+        time.sleep(0.5)
+
+    print("→ Google Careers...")
+    all_jobs += fetch_google()
+
+    print("→ Microsoft Careers...")
+    all_jobs += fetch_microsoft()
+
+    # Global dedup by company+title
     seen: set[str] = set()
     deduped = []
     for j in all_jobs:
@@ -275,85 +410,60 @@ def fetch_jobs() -> list[dict]:
             seen.add(key)
             deduped.append(j)
 
-    # Sort: MNCs first, then by recency
-    deduped.sort(key=lambda j: (
-        not j["highlight"],
-        j["age"] if j["age"] is not None else 999
-    ))
+    # Sort: by recency (most recent first)
+    deduped.sort(key=lambda j: j["age"] if j["age"] is not None else 999)
 
     result = deduped[:MAX_JOBS_EMAIL]
-    print(f"Total: {len(result)} jobs after dedup (from {len(all_jobs)} raw)")
+    print(f"\nTotal: {len(result)} jobs (from {len(all_jobs)} raw, {len(deduped)} after dedup)")
     return result
 
-# ── HTML email ─────────────────────────────────────────────────────────────────
+# ── HTML Email ─────────────────────────────────────────────────────────────────
 
 def age_badge(age) -> str:
-    if age is None:
-        label, bg, col = "recently", "#f0f0ec", "#666"
-    elif age == 0:
-        label, bg, col = "today",     "#EAF3DE", "#3B6D11"
-    elif age == 1:
-        label, bg, col = "yesterday", "#E6F1FB", "#185FA5"
-    elif age <= 3:
-        label, bg, col = f"{age}d ago","#FFF8E6", "#9A6B00"
-    else:
-        label, bg, col = f"{age}d ago","#f0f0ec", "#666"
-
-    return (
-        f'<span style="background:{bg};color:{col};font-size:11px;'
-        f'padding:1px 7px;border-radius:4px;font-weight:600;">🕐 {label}</span>'
-    )
-
-
-def source_badge(source: str) -> str:
-    colors = {
-        "Remotive":  ("#f5f0ff", "#6B21A8"),
-        "Himalayas": ("#FFF0F0", "#9A1818"),
-        "Arbeitnow": ("#F0FFF4", "#166534"),
-        "The Muse":  ("#FFF8E6", "#9A6B00"),
-    }
-    bg, col = colors.get(source, ("#f0f0ec", "#555"))
-    return (
-        f'<span style="background:{bg};color:{col};font-size:10px;'
-        f'padding:1px 6px;border-radius:4px;font-weight:500;">{source}</span>'
-    )
+    if age is None:   label, bg, col = "recently",  "#f0f0ec", "#666"
+    elif age == 0:    label, bg, col = "today",     "#EAF3DE", "#3B6D11"
+    elif age == 1:    label, bg, col = "yesterday", "#E6F1FB", "#185FA5"
+    elif age <= 3:    label, bg, col = f"{age}d ago","#FFF8E6","#9A6B00"
+    else:             label, bg, col = f"{age}d ago","#f5f0ec","#888"
+    return (f'<span style="background:{bg};color:{col};font-size:11px;'
+            f'padding:1px 7px;border-radius:4px;font-weight:600;">🕐 {label}</span>')
 
 
 def job_card_html(j: dict) -> str:
-    border = "border-left:3px solid #185FA5;" if j["highlight"] else ""
-    co_bg  = "#E6F1FB" if j["highlight"] else "#f0f0ec"
-    co_col = "#185FA5" if j["highlight"] else "#555"
-    desc_html = f'<div style="font-size:12px;color:#777;margin-bottom:8px;line-height:1.5;">{j["desc"]}{"…" if j["desc"] else ""}</div>' if j["desc"] else ""
-
+    color = j.get("color", "#185FA5")
+    dept_html = (
+        f'<span style="font-size:11px;color:#888;">· {j["dept"]}</span>'
+        if j.get("dept") else ""
+    )
     return f"""
 <div style="background:#fff;border:1px solid #e8e8e4;border-radius:8px;
-            padding:14px 18px;margin-bottom:10px;{border}">
+            padding:14px 18px;margin-bottom:10px;border-left:3px solid {color};">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;
               gap:8px;flex-wrap:wrap;margin-bottom:5px;">
     <div style="font-size:14px;font-weight:600;color:#1a1a1a;">{j['title']}</div>
-    <span style="background:{co_bg};color:{co_col};font-size:11px;
-                 padding:2px 8px;border-radius:4px;font-weight:600;white-space:nowrap;">
+    <span style="background:#f5f5f5;color:#333;font-size:11px;
+                 padding:2px 8px;border-radius:4px;font-weight:700;
+                 border-left:3px solid {color};white-space:nowrap;">
       {j['company']}
     </span>
   </div>
-  <div style="font-size:12px;color:#666;margin-bottom:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+  <div style="font-size:12px;color:#666;margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
     <span>📍 {j['location']}</span>
     {age_badge(j['age'])}
-    {source_badge(j['source'])}
+    {dept_html}
   </div>
-  {desc_html}
-  <a href="{j['url']}" style="font-size:12px;color:#185FA5;text-decoration:none;font-weight:500;">
-    View &amp; Apply →
+  <a href="{j['url']}" style="font-size:12px;color:{color};text-decoration:none;font-weight:600;">
+    Apply on {j['company']} →
   </a>
 </div>"""
 
 
 def build_email_html(jobs: list[dict], date_str: str) -> str:
-    total      = len(jobs)
-    highlights = sum(1 for j in jobs if j["highlight"])
+    total       = len(jobs)
     today_count = sum(1 for j in jobs if j["age"] == 0)
+    companies   = len({j["company"] for j in jobs})
     body = "".join(job_card_html(j) for j in jobs) if jobs else (
-        "<p style='color:#888;padding:20px 0;'>No matching fresh listings found today. Will retry tomorrow.</p>"
+        "<p style='color:#888;padding:20px 0;'>No fresh listings today. Will retry tomorrow.</p>"
     )
 
     return f"""<!DOCTYPE html>
@@ -363,10 +473,10 @@ def build_email_html(jobs: list[dict], date_str: str) -> str:
   <div style="max-width:620px;margin:32px auto;padding:0 16px 40px;">
 
     <div style="background:#1a1a1a;border-radius:10px;padding:24px 28px;margin-bottom:14px;">
-      <div style="font-size:11px;color:#888;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:4px;">Daily Job Digest</div>
+      <div style="font-size:11px;color:#888;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:4px;">Direct from MNC Portals</div>
       <div style="font-size:22px;font-weight:700;color:#fff;margin-bottom:4px;">🔔 Backend Engineer Roles</div>
       <div style="font-size:13px;color:#aaa;">
-        {date_str} &nbsp;·&nbsp; {total} listings &nbsp;·&nbsp; {today_count} posted today &nbsp;·&nbsp; {highlights} MNC
+        {date_str} &nbsp;·&nbsp; {total} listings &nbsp;·&nbsp; {today_count} posted today &nbsp;·&nbsp; {companies} companies
       </div>
     </div>
 
@@ -382,27 +492,26 @@ def build_email_html(jobs: list[dict], date_str: str) -> str:
     </div>
 
     <div style="font-size:11px;color:#888;margin-bottom:12px;">
-      🔵 Blue border = MNC &nbsp;·&nbsp; 🟢 Green = today &nbsp;·&nbsp; 🔵 Blue = yesterday &nbsp;·&nbsp; 🟡 Yellow = 2–7d
+      Each card links directly to the company's own careers portal · Sorted by most recent
     </div>
 
     {body}
 
     <div style="margin-top:20px;padding-top:14px;border-top:1px solid #e8e8e4;font-size:11px;color:#aaa;text-align:center;">
-      Sources: Remotive · Himalayas · Arbeitnow · The Muse &nbsp;·&nbsp; MNCs first · ≤7 days old · 7 AM IST daily
+      Sources: Greenhouse ATS · Lever ATS · Google Careers · Microsoft Careers<br>
+      Uber · Confluent · Databricks · Atlassian · Razorpay · Swiggy · Coinbase · Google · Microsoft + more
     </div>
   </div>
 </body>
 </html>"""
 
 
-# ── Gmail send ─────────────────────────────────────────────────────────────────
-
 def send_email(html_body: str, date_str: str):
     sender    = os.environ["GMAIL_ADDRESS"]
     password  = os.environ["GMAIL_APP_PASSWORD"]
     recipient = os.environ["RECIPIENT_EMAIL"]
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🔔 Job Digest — Backend Roles · {date_str}"
+    msg["Subject"] = f"🔔 MNC Job Digest — Backend Roles · {date_str}"
     msg["From"]    = f"Job Alert <{sender}>"
     msg["To"]      = recipient
     msg.attach(MIMEText(html_body, "html"))
@@ -411,8 +520,6 @@ def send_email(html_body: str, date_str: str):
         server.sendmail(sender, recipient, msg.as_string())
     print(f"Email sent → {recipient}")
 
-
-# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     date_str = datetime.date.today().strftime("%d %B %Y")
