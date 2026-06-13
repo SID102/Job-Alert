@@ -16,6 +16,7 @@ import smtplib
 import datetime
 import urllib.request
 import urllib.error
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -51,7 +52,8 @@ GEMINI_MODEL = "gemini-2.0-flash"   # free tier, fast, has Google Search groundi
 
 # ── Fetch jobs via Gemini + Google Search grounding ───────────────────────────
 
-def call_gemini(prompt: str) -> str:
+def call_gemini(prompt: str, retries: int = 4) -> str:
+    """Call Gemini REST API with exponential backoff on 429 rate-limit errors."""
     api_key = os.environ["GEMINI_API_KEY"]
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -60,84 +62,105 @@ def call_gemini(prompt: str) -> str:
 
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],          # free grounding — searches the web
+        "tools": [{"google_search": {}}],
         "generationConfig": {
             "temperature": 0.2,
             "maxOutputTokens": 2048,
         }
     }).encode("utf-8")
 
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
 
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+            parts = data["candidates"][0]["content"]["parts"]
+            return "".join(p.get("text", "") for p in parts)
 
-    # Extract text from Gemini response
-    try:
-        parts = data["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts)
-    except (KeyError, IndexError) as e:
-        print("Unexpected Gemini response structure:", json.dumps(data)[:400])
-        raise RuntimeError("Failed to parse Gemini response") from e
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = 15 * (2 ** attempt)   # 15s, 30s, 60s, 120s
+                print(f"Rate limited (429). Waiting {wait}s before retry {attempt+1}/{retries}...")
+                time.sleep(wait)
+            else:
+                print(f"HTTP error {e.code}: {e.reason}")
+                raise
+        except (KeyError, IndexError) as e:
+            print("Unexpected Gemini response structure")
+            raise RuntimeError("Failed to parse Gemini response") from e
+
+    raise RuntimeError("Gemini API still rate-limiting after all retries. Try again later.")
 
 
 def fetch_jobs() -> list[dict]:
-    company_list = "\n".join(f"- {c['name']}: {c['url']}" for c in COMPANIES)
+    """Fetch jobs in two batches to reduce prompt size and avoid rate limits."""
+    all_jobs: list[dict] = []
 
-    prompt = f"""You are a job board aggregator helping a backend engineer in India find top roles.
+    # Split companies into 2 batches of 6 — smaller prompts = less likely to hit limits
+    batches = [COMPANIES[:6], COMPANIES[6:]]
+
+    for batch_num, batch in enumerate(batches, 1):
+        company_list = "\n".join(f"- {c['name']}: {c['url']}" for c in batch)
+
+        prompt = f"""You are a job board aggregator helping a backend engineer in India find top roles.
 
 Candidate profile:
 {CANDIDATE_PROFILE}
 
-Search the web and each company's careers portal below to find currently open job listings
-for a Backend Engineer / Distributed Systems specialist with Java, Kafka, Cassandra,
-Spark, Spring Boot, Kubernetes skills. Focus on roles in India paying 20+ LPA.
+Search the web to find currently open job listings at these companies for a Backend Engineer
+with Java, Kafka, Cassandra, Spark, Spring Boot, Kubernetes skills. India roles, 20+ LPA.
 
-Company portals:
+Companies:
 {company_list}
 
-Return ONLY a valid JSON array — no markdown fences, no preamble, no trailing text.
-Each object must have exactly these keys:
-  company, title, location, url, salary_range, match_reason
+Return ONLY a valid JSON array — no markdown, no preamble, nothing else.
+Each object: company, title, location, url, salary_range, match_reason
+Max 2 listings per company. Prefer Kafka/Cassandra/Spark/distributed systems roles.
 
 Example:
-[{{"company":"Google","title":"Senior Software Engineer, Backend","location":"Bangalore, India","url":"https://careers.google.com/jobs/results/123","salary_range":"28-45 LPA","match_reason":"Distributed systems + Java + Kafka focus, strong Cassandra match"}}]
-
-Rules:
-- Max 2 listings per company
-- Prefer roles that explicitly mention Kafka, Cassandra, Spark, or distributed systems
-- Use the actual job posting URL where possible; fall back to the portal URL
-- salary_range: use known market ranges for the level even if not listed on posting
-- Return only the JSON array, nothing else
+[{{"company":"Uber","title":"Senior Software Engineer - Backend","location":"Bangalore, India","url":"https://uber.com/careers/...","salary_range":"30-50 LPA","match_reason":"Distributed systems, Kafka event streaming focus"}}]
 """
 
-    print("Calling Gemini with Google Search grounding...")
-    raw = call_gemini(prompt)
+        print(f"Batch {batch_num}/2: querying {len(batch)} companies...")
+        try:
+            raw = call_gemini(prompt)
+        except RuntimeError as e:
+            print(f"Batch {batch_num} failed: {e}")
+            continue
 
-    # Extract JSON array from response
-    raw = raw.strip()
-    # Strip markdown fences if present
-    if "```" in raw:
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
+        # Parse JSON
+        raw = raw.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
 
-    start = raw.find("[")
-    end = raw.rfind("]") + 1
-    if start == -1 or end == 0:
-        print("Warning: no JSON array found in Gemini response")
-        print("Raw (first 600 chars):", raw[:600])
-        return []
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        if start == -1 or end == 0:
+            print(f"Batch {batch_num}: no JSON array found. Raw: {raw[:300]}")
+            continue
 
-    jobs = json.loads(raw[start:end])
-    print(f"Fetched {len(jobs)} job listings across {len({j.get('company') for j in jobs})} companies")
-    return jobs
+        try:
+            jobs = json.loads(raw[start:end])
+            all_jobs.extend(jobs)
+            print(f"Batch {batch_num}: got {len(jobs)} listings")
+        except json.JSONDecodeError as e:
+            print(f"Batch {batch_num}: JSON parse error — {e}")
+
+        # Small pause between batches to be polite to the API
+        if batch_num < len(batches):
+            time.sleep(5)
+
+    print(f"Total: {len(all_jobs)} listings across {len({j.get('company') for j in all_jobs})} companies")
+    return all_jobs
 
 
 # ── Build HTML email ───────────────────────────────────────────────────────────
