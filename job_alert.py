@@ -1,13 +1,14 @@
 """
 Daily Job Alert — Siddharth Singh
-Fetches top backend/Kafka/distributed systems roles from target companies
-using Google Gemini (FREE) + Google Search Grounding, then sends via Gmail SMTP.
+Fetches backend/distributed-systems roles via Adzuna API (free, 250 req/day),
+filters by target companies, sends a styled digest via Gmail SMTP.
 
 Required GitHub Actions secrets:
-  GEMINI_API_KEY      — free from aistudio.google.com (no credit card)
+  ADZUNA_APP_ID       — from developer.adzuna.com (free registration)
+  ADZUNA_APP_KEY      — from developer.adzuna.com (free registration)
   GMAIL_ADDRESS       — your Gmail address
-  GMAIL_APP_PASSWORD  — 16-char Gmail App Password (Google Account → Security)
-  RECIPIENT_EMAIL     — where to send the digest
+  GMAIL_APP_PASSWORD  — 16-char Gmail App Password
+  RECIPIENT_EMAIL     — where to deliver the digest
 """
 
 import os
@@ -15,221 +16,217 @@ import json
 import smtplib
 import datetime
 import urllib.request
+import urllib.parse
 import urllib.error
-import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-COMPANIES = [
-    {"name": "Google",      "url": "https://careers.google.com/jobs/results/?q=backend+engineer&location=India"},
-    {"name": "Microsoft",   "url": "https://jobs.careers.microsoft.com/global/en/search?q=backend+engineer&l=India"},
-    {"name": "Amazon",      "url": "https://www.amazon.jobs/en/search?base_query=backend+engineer&loc_query=India"},
-    {"name": "Uber",        "url": "https://www.uber.com/global/en/careers/list/?query=backend+india"},
-    {"name": "Flipkart",    "url": "https://www.flipkartcareers.com/#!/joblist"},
-    {"name": "PhonePe",     "url": "https://careers.phonepe.com/?q=backend"},
-    {"name": "Razorpay",    "url": "https://razorpay.com/jobs/#openings"},
-    {"name": "CRED",        "url": "https://careers.cred.club/"},
-    {"name": "Swiggy",      "url": "https://careers.swiggy.com/#careers"},
-    {"name": "Confluent",   "url": "https://careers.confluent.io/?search=india"},
-    {"name": "Databricks",  "url": "https://www.databricks.com/company/careers/open-positions?location=India"},
-    {"name": "Zepto",       "url": "https://www.zepto.co.in/careers"},
+CANDIDATE_PROFILE = {
+    "name": "Siddharth Singh",
+    "title": "Backend Engineer | Distributed Systems",
+    "stack": "Java · Kafka · Cassandra · Spark · Spring Boot · Kubernetes",
+    "target": "SDE-2 / Senior Backend · 20+ LPA · India",
+}
+
+# Keywords to search — Adzuna will match these against job titles + descriptions
+SEARCH_QUERIES = [
+    "backend engineer java kafka",
+    "distributed systems java kafka cassandra",
+    "software engineer kafka cassandra spark",
+    "senior backend engineer java spring boot",
+    "platform engineer kafka kubernetes india",
 ]
 
-CANDIDATE_PROFILE = """
-Name: Siddharth Singh
-Title: Backend Engineer | Distributed Systems
-Experience: 3+ years at Thales (Fortune 500 defense-tech)
-Core stack: Java, Apache Kafka, Apache Cassandra (LWT, bucketing, quorum),
-            Apache Spark, Spring Boot, Kubernetes, Docker, Keycloak, OAuth2
-Key wins: 90% race-condition elimination, 85% downtime prevention,
-          40% latency reduction, Employee Recognition Award
-Target: SDE-2 / Senior Backend Engineer roles paying 20+ LPA in India
-"""
+# Target companies — jobs from these get a highlight badge in the email
+TARGET_COMPANIES = [
+    "google", "microsoft", "amazon", "uber", "flipkart", "phonepe",
+    "razorpay", "cred", "swiggy", "confluent", "databricks", "zepto",
+    "meesho", "zomato", "paytm", "atlassian", "adobe", "salesforce",
+    "goldman sachs", "jp morgan", "morgan stanley",
+]
 
-GEMINI_MODEL = "gemini-2.0-flash"   # free tier, fast, has Google Search grounding
+ADZUNA_COUNTRY = "in"          # India
+ADZUNA_RESULTS_PER_QUERY = 10  # fetch top 10 per query, deduplicate after
+MIN_SALARY_INR = 2_000_000     # ~20 LPA (Adzuna uses annual INR)
 
-# ── Fetch jobs via Gemini + Google Search grounding ───────────────────────────
+# ── Fetch jobs from Adzuna API ─────────────────────────────────────────────────
 
-def call_gemini(prompt: str, retries: int = 4) -> str:
-    """Call Gemini REST API with exponential backoff on 429 rate-limit errors."""
-    api_key = os.environ["GEMINI_API_KEY"]
+def fetch_adzuna(query: str, app_id: str, app_key: str) -> list[dict]:
+    params = urllib.parse.urlencode({
+        "app_id": app_id,
+        "app_key": app_key,
+        "results_per_page": ADZUNA_RESULTS_PER_QUERY,
+        "what": query,
+        "where": "India",
+        "salary_min": MIN_SALARY_INR,
+        "sort_by": "relevance",
+        "content-type": "application/json",
+    })
+
     url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={api_key}"
+        f"https://api.adzuna.com/v1/api/jobs/{ADZUNA_COUNTRY}/search/1?{params}"
     )
 
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 2048,
-        }
-    }).encode("utf-8")
+    req = urllib.request.Request(url, headers={"User-Agent": "JobAlertBot/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data.get("results", [])
+    except urllib.error.HTTPError as e:
+        print(f"  Adzuna HTTP {e.code} for query '{query}': {e.reason}")
+        return []
+    except Exception as e:
+        print(f"  Adzuna error for query '{query}': {e}")
+        return []
 
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
 
-            parts = data["candidates"][0]["content"]["parts"]
-            return "".join(p.get("text", "") for p in parts)
-
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                wait = 15 * (2 ** attempt)   # 15s, 30s, 60s, 120s
-                print(f"Rate limited (429). Waiting {wait}s before retry {attempt+1}/{retries}...")
-                time.sleep(wait)
-            else:
-                print(f"HTTP error {e.code}: {e.reason}")
-                raise
-        except (KeyError, IndexError) as e:
-            print("Unexpected Gemini response structure")
-            raise RuntimeError("Failed to parse Gemini response") from e
-
-    raise RuntimeError("Gemini API still rate-limiting after all retries. Try again later.")
+def is_target_company(company_name: str) -> bool:
+    name_lower = company_name.lower()
+    return any(t in name_lower for t in TARGET_COMPANIES)
 
 
 def fetch_jobs() -> list[dict]:
-    """Fetch jobs in two batches to reduce prompt size and avoid rate limits."""
+    app_id  = os.environ["ADZUNA_APP_ID"]
+    app_key = os.environ["ADZUNA_APP_KEY"]
+
+    seen_ids: set[str] = set()
     all_jobs: list[dict] = []
 
-    # Split companies into 2 batches of 6 — smaller prompts = less likely to hit limits
-    batches = [COMPANIES[:6], COMPANIES[6:]]
+    for query in SEARCH_QUERIES:
+        print(f"  Searching: '{query}'...")
+        results = fetch_adzuna(query, app_id, app_key)
 
-    for batch_num, batch in enumerate(batches, 1):
-        company_list = "\n".join(f"- {c['name']}: {c['url']}" for c in batch)
+        for r in results:
+            job_id = r.get("id", "")
+            if job_id in seen_ids:
+                continue
+            seen_ids.add(job_id)
 
-        prompt = f"""You are a job board aggregator helping a backend engineer in India find top roles.
+            company  = r.get("company", {}).get("display_name", "Unknown")
+            title    = r.get("title", "")
+            location = r.get("location", {}).get("display_name", "India")
+            url      = r.get("redirect_url", "#")
+            salary_min = r.get("salary_min") or 0
+            salary_max = r.get("salary_max") or 0
+            description = r.get("description", "")[:200]
 
-Candidate profile:
-{CANDIDATE_PROFILE}
+            # Compute salary label
+            if salary_min and salary_max:
+                lpa_min = round(salary_min / 100_000)
+                lpa_max = round(salary_max / 100_000)
+                salary_label = f"{lpa_min}–{lpa_max} LPA"
+            elif salary_min:
+                lpa_min = round(salary_min / 100_000)
+                salary_label = f"{lpa_min}+ LPA"
+            else:
+                salary_label = "Competitive"
 
-Search the web to find currently open job listings at these companies for a Backend Engineer
-with Java, Kafka, Cassandra, Spark, Spring Boot, Kubernetes skills. India roles, 20+ LPA.
+            all_jobs.append({
+                "id":          job_id,
+                "company":     company,
+                "title":       title,
+                "location":    location,
+                "url":         url,
+                "salary":      salary_label,
+                "description": description,
+                "highlight":   is_target_company(company),
+            })
 
-Companies:
-{company_list}
+    # Sort: target companies first, then rest
+    all_jobs.sort(key=lambda j: (not j["highlight"], j["company"].lower()))
 
-Return ONLY a valid JSON array — no markdown, no preamble, nothing else.
-Each object: company, title, location, url, salary_range, match_reason
-Max 2 listings per company. Prefer Kafka/Cassandra/Spark/distributed systems roles.
-
-Example:
-[{{"company":"Uber","title":"Senior Software Engineer - Backend","location":"Bangalore, India","url":"https://uber.com/careers/...","salary_range":"30-50 LPA","match_reason":"Distributed systems, Kafka event streaming focus"}}]
-"""
-
-        print(f"Batch {batch_num}/2: querying {len(batch)} companies...")
-        try:
-            raw = call_gemini(prompt)
-        except RuntimeError as e:
-            print(f"Batch {batch_num} failed: {e}")
-            continue
-
-        # Parse JSON
-        raw = raw.strip()
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        start = raw.find("[")
-        end = raw.rfind("]") + 1
-        if start == -1 or end == 0:
-            print(f"Batch {batch_num}: no JSON array found. Raw: {raw[:300]}")
-            continue
-
-        try:
-            jobs = json.loads(raw[start:end])
-            all_jobs.extend(jobs)
-            print(f"Batch {batch_num}: got {len(jobs)} listings")
-        except json.JSONDecodeError as e:
-            print(f"Batch {batch_num}: JSON parse error — {e}")
-
-        # Small pause between batches to be polite to the API
-        if batch_num < len(batches):
-            time.sleep(5)
-
-    print(f"Total: {len(all_jobs)} listings across {len({j.get('company') for j in all_jobs})} companies")
+    print(f"Total: {len(all_jobs)} unique listings")
     return all_jobs
 
 
 # ── Build HTML email ───────────────────────────────────────────────────────────
 
+def job_card_html(j: dict) -> str:
+    highlight_style = (
+        "border-left: 3px solid #185FA5;" if j["highlight"] else ""
+    )
+    company_badge_bg  = "#E6F1FB" if j["highlight"] else "#f0f0ec"
+    company_badge_col = "#185FA5" if j["highlight"] else "#555"
+
+    return f"""
+<div style="background:#fff;border:1px solid #e8e8e4;border-radius:8px;
+            padding:14px 18px;margin-bottom:10px;{highlight_style}">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;
+              gap:8px;flex-wrap:wrap;margin-bottom:5px;">
+    <div style="font-size:15px;font-weight:600;color:#1a1a1a;">{j['title']}</div>
+    <span style="background:{company_badge_bg};color:{company_badge_col};font-size:11px;
+                 padding:2px 8px;border-radius:4px;font-weight:600;white-space:nowrap;">
+      {j['company']}
+    </span>
+  </div>
+  <div style="font-size:12px;color:#666;margin-bottom:5px;">
+    📍 {j['location']} &nbsp;·&nbsp;
+    <span style="background:#EAF3DE;color:#3B6D11;font-size:11px;
+                 padding:2px 7px;border-radius:4px;font-weight:600;">{j['salary']}</span>
+  </div>
+  <div style="font-size:12px;color:#777;margin-bottom:8px;line-height:1.5;">
+    {j['description']}{'…' if j['description'] else ''}
+  </div>
+  <a href="{j['url']}"
+     style="font-size:12px;color:#185FA5;text-decoration:none;font-weight:500;">
+    View job →
+  </a>
+</div>"""
+
+
 def build_email_html(jobs: list[dict], date_str: str) -> str:
+    total      = len(jobs)
+    highlights = sum(1 for j in jobs if j["highlight"])
+    companies  = len({j["company"] for j in jobs})
+
     if not jobs:
-        body_content = "<p style='color:#888;padding:20px 0;'>No listings found today. Will retry tomorrow.</p>"
+        body = "<p style='color:#888;padding:20px 0;'>No matching listings found today. Will retry tomorrow.</p>"
     else:
-        by_company: dict[str, list] = {}
-        for j in jobs:
-            by_company.setdefault(j.get("company", "Other"), []).append(j)
-
-        cards = ""
-        for company, listings in by_company.items():
-            for j in listings:
-                salary = j.get("salary_range", "")
-                salary_badge = (
-                    f'<span style="background:#EAF3DE;color:#3B6D11;font-size:11px;'
-                    f'padding:2px 8px;border-radius:4px;font-weight:600;">{salary}</span>'
-                ) if salary else ""
-
-                cards += f"""
-                <div style="background:#fff;border:1px solid #e8e8e4;border-radius:8px;
-                            padding:14px 18px;margin-bottom:10px;">
-                  <div style="display:flex;justify-content:space-between;align-items:flex-start;
-                              gap:8px;flex-wrap:wrap;margin-bottom:6px;">
-                    <div style="font-size:15px;font-weight:600;color:#1a1a1a;">{j.get('title','Role')}</div>
-                    <span style="background:#E6F1FB;color:#185FA5;font-size:11px;
-                                 padding:2px 8px;border-radius:4px;font-weight:600;">{company}</span>
-                  </div>
-                  <div style="font-size:12px;color:#666;margin-bottom:6px;">
-                    📍 {j.get('location','India')} &nbsp;·&nbsp; {salary_badge}
-                  </div>
-                  <div style="font-size:12px;color:#555;margin-bottom:8px;font-style:italic;">
-                    {j.get('match_reason','')}
-                  </div>
-                  <a href="{j.get('url','#')}"
-                     style="font-size:12px;color:#185FA5;text-decoration:none;font-weight:500;">
-                    View on portal →
-                  </a>
-                </div>"""
-        body_content = cards
-
-    total = len(jobs)
-    companies_hit = len({j.get("company") for j in jobs})
+        body = "".join(job_card_html(j) for j in jobs)
 
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f5f4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
-  <div style="max-width:600px;margin:32px auto;background:#f5f4f0;padding:0 16px 32px;">
-    <div style="background:#1a1a1a;border-radius:10px;padding:24px 28px;margin-bottom:16px;">
-      <div style="font-size:11px;color:#888;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:4px;">Daily Job Digest</div>
-      <div style="font-size:22px;font-weight:600;color:#fff;margin-bottom:4px;">🔔 Backend Engineer Roles</div>
-      <div style="font-size:13px;color:#aaa;">{date_str} · {total} listings · {companies_hit} companies</div>
+<body style="margin:0;padding:0;background:#f5f4f0;
+             font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <div style="max-width:620px;margin:32px auto;padding:0 16px 40px;">
+
+    <!-- Header -->
+    <div style="background:#1a1a1a;border-radius:10px;padding:24px 28px;margin-bottom:14px;">
+      <div style="font-size:11px;color:#888;letter-spacing:0.08em;
+                  text-transform:uppercase;margin-bottom:4px;">Daily Job Digest</div>
+      <div style="font-size:22px;font-weight:700;color:#fff;margin-bottom:4px;">
+        🔔 Backend Engineer Roles
+      </div>
+      <div style="font-size:13px;color:#aaa;">
+        {date_str} &nbsp;·&nbsp; {total} listings &nbsp;·&nbsp;
+        {highlights} target companies &nbsp;·&nbsp; {companies} total companies
+      </div>
     </div>
-    <div style="background:#fff;border:1px solid #e8e8e4;border-radius:8px;padding:12px 18px;margin-bottom:16px;">
+
+    <!-- Profile -->
+    <div style="background:#fff;border:1px solid #e8e8e4;border-radius:8px;
+                padding:12px 18px;margin-bottom:14px;">
       <div style="display:flex;align-items:center;gap:12px;">
-        <div style="width:36px;height:36px;border-radius:50%;background:#E6F1FB;display:flex;align-items:center;
-                    justify-content:center;font-weight:600;font-size:13px;color:#185FA5;flex-shrink:0;">SS</div>
+        <div style="width:38px;height:38px;border-radius:50%;background:#E6F1FB;
+                    display:flex;align-items:center;justify-content:center;
+                    font-weight:700;font-size:13px;color:#185FA5;flex-shrink:0;">SS</div>
         <div>
           <div style="font-size:13px;font-weight:600;color:#1a1a1a;">Siddharth Singh</div>
-          <div style="font-size:11px;color:#888;">Java · Kafka · Cassandra · Spark · SDE-2 · 20+ LPA</div>
+          <div style="font-size:11px;color:#888;">{CANDIDATE_PROFILE['stack']}</div>
         </div>
       </div>
     </div>
-    {body_content}
-    <div style="margin-top:24px;padding-top:16px;border-top:1px solid #e8e8e4;font-size:11px;color:#aaa;text-align:center;">
-      Automated · GitHub Actions · Powered by Google Gemini (free)
+
+    <!-- Listings -->
+    {body}
+
+    <!-- Footer -->
+    <div style="margin-top:20px;padding-top:14px;border-top:1px solid #e8e8e4;
+                font-size:11px;color:#aaa;text-align:center;">
+      Automated · GitHub Actions · Adzuna Jobs API · Runs daily at 7 AM IST
     </div>
   </div>
 </body>
@@ -239,8 +236,8 @@ def build_email_html(jobs: list[dict], date_str: str) -> str:
 # ── Send via Gmail SMTP ────────────────────────────────────────────────────────
 
 def send_email(html_body: str, date_str: str):
-    sender   = os.environ["GMAIL_ADDRESS"]
-    password = os.environ["GMAIL_APP_PASSWORD"]
+    sender    = os.environ["GMAIL_ADDRESS"]
+    password  = os.environ["GMAIL_APP_PASSWORD"]
     recipient = os.environ["RECIPIENT_EMAIL"]
 
     msg = MIMEMultipart("alternative")
@@ -261,8 +258,11 @@ def send_email(html_body: str, date_str: str):
 def main():
     date_str = datetime.date.today().strftime("%d %B %Y")
     print(f"=== Job Alert — {date_str} ===")
+    print("Fetching jobs from Adzuna...")
     jobs = fetch_jobs()
+    print("Building email...")
     html = build_email_html(jobs, date_str)
+    print("Sending email...")
     send_email(html, date_str)
     print("Done ✓")
 

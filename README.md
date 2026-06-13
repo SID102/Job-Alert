@@ -1,98 +1,75 @@
 # Daily Job Alert — Siddharth Singh
 
-Automated daily digest of top Backend Engineer / SDE-2 roles across 12 companies,
-fetched via **Google Gemini (free)** + Google Search, delivered to Gmail at 7 AM IST.
+Automated daily digest of Backend Engineer / SDE-2 roles fetched from
+**Adzuna Jobs API** (free), filtered for Java · Kafka · Cassandra · Spark
+skills, delivered to Gmail every morning at 7 AM IST via GitHub Actions.
 
-**Zero cost. No credit card. Uses only free APIs.**
+**Zero cost. No credit card. Pure Python stdlib — no pip installs.**
 
 ---
 
 ## Setup (5 minutes)
 
-### Step 1 — Get your FREE Gemini API key
+### Step 1 — Get a free Adzuna API key
 
-1. Go to **https://aistudio.google.com**
-2. Sign in with your Google account
-3. Click **"Get API key"** → **"Create API key"**
-4. Copy the key (starts with `AIza...`)
+1. Go to **https://developer.adzuna.com**
+2. Click **"Register"** — sign up with email (free, no credit card)
+3. Go to **Dashboard** → you'll see your **App ID** and **App Key**
+4. Copy both values
 
-That's it — free tier gives 1,500 requests/day. More than enough.
+Free tier: 250 requests/day. The script uses ~5 requests per run. More than enough.
 
 ---
 
 ### Step 2 — Get a Gmail App Password
 
-> Google blocks plain password login for scripts. App Password is the fix.
-
 1. Go to **https://myaccount.google.com/security**
 2. Make sure **2-Step Verification** is ON
-3. Search for **"App passwords"** at the top
-4. Create one → App: Mail → Device: Other → name it "Job Alert"
-5. Copy the **16-character password** (ignore spaces)
+3. Search **"App passwords"** → create one → name it "Job Alert"
+4. Copy the **16-character password**
 
 ---
 
 ### Step 3 — Push to GitHub
 
 ```bash
-# unzip the downloaded file first, then:
 cd job-alert
 git init
 git add .
 git commit -m "init job alert"
 gh repo create job-alert --private --push
-# (or create repo manually on github.com and push)
 ```
 
 ---
 
-### Step 4 — Add 4 secrets to GitHub
+### Step 4 — Add 5 secrets
 
 Repo → **Settings → Secrets and variables → Actions → New repository secret**
 
-| Secret name          | Value                                   |
-|----------------------|-----------------------------------------|
-| `GEMINI_API_KEY`     | The `AIza...` key from Step 1           |
-| `GMAIL_ADDRESS`      | `siddharthsingh002018@gmail.com`        |
-| `GMAIL_APP_PASSWORD` | The 16-char password from Step 2        |
-| `RECIPIENT_EMAIL`    | `siddharthsingh002018@gmail.com`        |
+| Secret               | Value                              |
+|----------------------|------------------------------------|
+| `ADZUNA_APP_ID`      | Your App ID from developer.adzuna.com |
+| `ADZUNA_APP_KEY`     | Your App Key from developer.adzuna.com |
+| `GMAIL_ADDRESS`      | `siddharthsingh002018@gmail.com`   |
+| `GMAIL_APP_PASSWORD` | 16-char App Password               |
+| `RECIPIENT_EMAIL`    | `siddharthsingh002018@gmail.com`   |
 
 ---
 
-### Step 5 — Test it now
+### Step 5 — Test it
 
-Repo → **Actions tab** → **"Daily Job Alert"** → **"Run workflow"** → **"Run workflow"**
+Repo → **Actions** → **"Daily Job Alert"** → **"Run workflow"**
 
-Watch the logs. If it goes green, check your inbox. Done.
-
-After that it fires automatically every day at **7:00 AM IST** — no maintenance needed.
+Runs in ~30 seconds. Check your inbox.
 
 ---
 
 ## Customise
 
-**Add a company** — edit `COMPANIES` list in `job_alert.py`:
-```python
-{"name": "Coinbase", "url": "https://www.coinbase.com/careers/positions?department=Engineering"},
-```
+**Add search terms** — edit `SEARCH_QUERIES` in `job_alert.py`
 
-**Change schedule** — edit `.github/workflows/daily_job_alert.yml`:
-```yaml
-- cron: "30 1 * * *"   # 1:30 AM UTC = 7:00 AM IST
-- cron: "0 2 * * *"    # 2:00 AM UTC = 7:30 AM IST
-```
-Use https://crontab.guru to build expressions.
+**Add target companies** — edit `TARGET_COMPANIES` list (blue-highlighted in email)
 
----
+**Change salary floor** — edit `MIN_SALARY_INR = 2_000_000` (2M INR = 20 LPA)
 
-## Files
-
-```
-job-alert/
-├── job_alert.py                       # main script (pure stdlib + Gemini REST)
-├── requirements.txt                   # empty — no pip installs needed
-├── README.md
-└── .github/
-    └── workflows/
-        └── daily_job_alert.yml        # GitHub Actions cron schedule
-```
+**Change schedule** — edit `.github/workflows/daily_job_alert.yml` cron line
