@@ -23,6 +23,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import time
+import re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -48,6 +49,55 @@ EXCLUDE_KEYWORDS = [
     "designer", "sales", "marketing", "recruiter", "hr", "legal",
     "finance", "accounting", "junior", "manual qa", "test engineer",
 ]
+
+
+# ── Experience-level filtering ─────────────────────────────────────────────────
+# Sid has 3.5 yrs. Accept roles for 2–5 yrs. Reject 6+ yr requirements.
+
+EXCLUDE_TITLE_SENIORITY = [
+    "staff engineer", "staff software", "principal engineer",
+    "principal software", "distinguished engineer", "fellow",
+    "vp of engineering", "director of engineering", "engineering manager",
+    "head of engineering", "vp engineering",
+]
+
+def exceeds_experience(text: str) -> bool:
+    """
+    True if job clearly demands more experience than Sid has (3.5 yrs).
+    Rejects if minimum experience required is 5+ years.
+    Accepts if requirement is 0–4 years, or ambiguous.
+    """
+    t = text.lower()
+
+    # Pattern: "X+ years" or "X years+" — reject if X >= 5
+    for m in re.findall(r'(\d+)\s*\+\s*years?', t):
+        if int(m) >= 5:
+            return True
+
+    # Pattern: "minimum X years" / "at least X years" / "X years experience"
+    for pat in [
+        r'minimum\s+(?:of\s+)?(\d+)\s+years?',
+        r'at\s+least\s+(\d+)\s+years?',
+        r'(\d+)\s+years?\s+of\s+(?:relevant\s+)?(?:work\s+)?experience',
+        r'experience\s+of\s+(\d+)\s+years?',
+        r'(\d+)\s+years?\s+(?:of\s+)?(?:professional\s+)?experience',
+    ]:
+        for m in re.findall(pat, t):
+            if int(m) >= 5:
+                return True
+
+    # Pattern: range like "5-8 years" or "6-10 years" — reject if lower bound >= 5
+    for m in re.findall(r'(\d+)\s*[-–]\s*\d+\s*years?', t):
+        if int(m) >= 5:
+            return True
+
+    return False
+
+
+def title_too_senior(title: str) -> bool:
+    t = title.lower()
+    return any(s in t for s in EXCLUDE_TITLE_SENIORITY)
+
 
 # ── Company Configs ────────────────────────────────────────────────────────────
 
@@ -123,10 +173,22 @@ def days_ago(dt: datetime.date | None) -> int | None:
     return (datetime.date.today() - dt).days
 
 
-def is_relevant(title: str, dept: str = "", location: str = "") -> bool:
+def is_relevant(title: str, dept: str = "", location: str = "", desc: str = "") -> bool:
+    """Check role is relevant AND fits Sid's 3.5 yrs experience level."""
     text = (title + " " + dept + " " + location).lower()
+
+    # Exclude irrelevant domains / roles
     if any(k in text for k in EXCLUDE_KEYWORDS):
         return False
+
+    # Exclude titles clearly above SDE-2/Senior level (Staff, Principal, VP...)
+    if title_too_senior(title):
+        return False
+
+    # Exclude if description explicitly demands 6+ years
+    if desc and exceeds_experience(desc):
+        return False
+
     return any(k in text for k in RELEVANT_KEYWORDS)
 
 
@@ -175,7 +237,11 @@ def fetch_greenhouse(company: dict) -> list[dict]:
         if not is_india_or_remote(location):
             continue
 
-        if not is_relevant(title, dept, location):
+        # Extract plain text from HTML description for experience parsing
+        raw_desc = r.get("content", "") or r.get("description", "")
+        desc     = re.sub(r'<[^>]+>', ' ', raw_desc)   # strip HTML tags
+
+        if not is_relevant(title, dept, location, desc):
             continue
 
         link     = r.get("absolute_url", "#")
@@ -187,14 +253,15 @@ def fetch_greenhouse(company: dict) -> list[dict]:
             continue
 
         results.append({
-            "company":  name,
-            "title":    title.strip(),
-            "location": location.strip(),
-            "dept":     dept,
-            "url":      link,
-            "age":      age,
-            "source":   "Greenhouse",
-            "color":    company["color"],
+            "company":   name,
+            "title":     title.strip(),
+            "location":  location.strip(),
+            "dept":      dept,
+            "url":       link,
+            "age":       age,
+            "source":    "Greenhouse",
+            "color":     company["color"],
+            "exp_label": extract_exp_label(desc) if 'desc' in dir() else "",
         })
 
     print(f"    {name}: {len(results)} matching jobs")
@@ -229,22 +296,26 @@ def fetch_lever(company: dict) -> list[dict]:
         pub_date = parse_date(str(pub_ts)) if pub_ts else None
         age      = days_ago(pub_date)
 
+        raw_desc = r.get("descriptionPlain", "") or r.get("description", "")
+        desc     = re.sub(r'<[^>]+>', ' ', raw_desc)
+
         if not is_india_or_remote(location):
             continue
-        if not is_relevant(title, dept, location):
+        if not is_relevant(title, dept, location, desc):
             continue
         if age is not None and age > MAX_AGE_DAYS:
             continue
 
         results.append({
-            "company":  name,
-            "title":    title.strip(),
-            "location": location.strip(),
-            "dept":     dept,
-            "url":      link,
-            "age":      age,
-            "source":   "Lever",
-            "color":    company["color"],
+            "company":   name,
+            "title":     title.strip(),
+            "location":  location.strip(),
+            "dept":      dept,
+            "url":       link,
+            "age":       age,
+            "source":    "Lever",
+            "color":     company["color"],
+            "exp_label": extract_exp_label(desc),
         })
 
     print(f"    {name}: {len(results)} matching jobs")
@@ -289,14 +360,15 @@ def fetch_google() -> list[dict]:
                     continue
 
                 results.append({
-                    "company":  "Google",
-                    "title":    title.strip(),
-                    "location": location.strip(),
-                    "dept":     "",
-                    "url":      link,
-                    "age":      age,
-                    "source":   "Google Careers",
-                    "color":    "#4285F4",
+                    "company":   "Google",
+                    "title":     title.strip(),
+                    "location":  location.strip(),
+                    "dept":      "",
+                    "url":       link,
+                    "age":       age,
+                    "source":    "Google Careers",
+                    "color":     "#4285F4",
+                    "exp_label": "",
                 })
         except Exception as e:
             print(f"    Google query '{q}': {e}")
@@ -356,14 +428,15 @@ def fetch_microsoft() -> list[dict]:
                     continue
 
                 results.append({
-                    "company":  "Microsoft",
-                    "title":    title.strip(),
-                    "location": location.strip(),
-                    "dept":     "",
-                    "url":      link,
-                    "age":      age,
-                    "source":   "Microsoft Careers",
-                    "color":    "#00A4EF",
+                    "company":   "Microsoft",
+                    "title":     title.strip(),
+                    "location":  location.strip(),
+                    "dept":      "",
+                    "url":       link,
+                    "age":       age,
+                    "source":    "Microsoft Careers",
+                    "color":     "#00A4EF",
+                    "exp_label": "",
                 })
         except Exception as e:
             print(f"    Microsoft query '{q}': {e}")
@@ -419,6 +492,24 @@ def fetch_jobs() -> list[dict]:
 
 # ── HTML Email ─────────────────────────────────────────────────────────────────
 
+def extract_exp_label(desc: str) -> str:
+    """Extract experience requirement from description for display."""
+    if not desc:
+        return ""
+    t = desc.lower()
+    # Try to find "X-Y years" or "X+ years"
+    m = re.search(r'(\d+)\s*[-–]\s*(\d+)\s*years?', t)
+    if m:
+        return f"{m.group(1)}–{m.group(2)} yrs"
+    m = re.search(r'(\d+)\s*\+\s*years?', t)
+    if m:
+        return f"{m.group(1)}+ yrs"
+    m = re.search(r'(\d+)\s+years?\s+of\s+(?:relevant\s+)?experience', t)
+    if m:
+        return f"{m.group(1)}+ yrs"
+    return ""
+
+
 def age_badge(age) -> str:
     if age is None:   label, bg, col = "recently",  "#f0f0ec", "#666"
     elif age == 0:    label, bg, col = "today",     "#EAF3DE", "#3B6D11"
@@ -451,6 +542,7 @@ def job_card_html(j: dict) -> str:
     <span>📍 {j['location']}</span>
     {age_badge(j['age'])}
     {dept_html}
+    {(f'<span style="background:#FFF0F0;color:#9A1818;font-size:11px;padding:1px 7px;border-radius:4px;font-weight:600;">👤 ' + j.get('exp_label','') + '</span>') if j.get('exp_label') else ''}
   </div>
   <a href="{j['url']}" style="font-size:12px;color:{color};text-decoration:none;font-weight:600;">
     Apply on {j['company']} →

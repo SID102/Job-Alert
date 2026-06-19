@@ -2,7 +2,7 @@ name: Daily Job Alert
 
 on:
   schedule:
-    - cron: "30 1 * * *"   # 7:00 AM IST daily
+    - cron: "15 1 * * *"   # 6:45 AM IST — buffers GitHub's scheduling delay so it lands ~7:00 AM IST
   workflow_dispatch:
 
 jobs:
